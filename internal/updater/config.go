@@ -20,15 +20,27 @@ const (
 
 var fixedServices = [...]string{"postgres", "message-init", "message-server", "caddy"}
 
+type CaddyMode string
+
+const (
+	CaddyModeCompose CaddyMode = "compose"
+	CaddyModeSystemd CaddyMode = "systemd"
+)
+
+func (mode CaddyMode) valid() bool {
+	return mode == CaddyModeCompose || mode == CaddyModeSystemd
+}
+
 func FixedServices() []string {
 	return append([]string(nil), fixedServices[:]...)
 }
 
 type Config struct {
-	SchemaVersion    int    `json:"schema_version"`
-	StateDir         string `json:"state_dir"`
-	SocketPath       string `json:"socket_path"`
-	ControlTokenFile string `json:"control_token_file"`
+	SchemaVersion    int       `json:"schema_version"`
+	StateDir         string    `json:"state_dir"`
+	SocketPath       string    `json:"socket_path"`
+	ControlTokenFile string    `json:"control_token_file"`
+	CaddyMode        CaddyMode `json:"caddy_mode,omitempty"`
 }
 
 func LoadConfig(reader io.Reader) (Config, error) {
@@ -43,6 +55,12 @@ func LoadConfig(reader io.Reader) (Config, error) {
 	}
 	if config.SchemaVersion != SupportedConfigVersion {
 		return Config{}, fmt.Errorf("schema_version %d is not supported", config.SchemaVersion)
+	}
+	if config.CaddyMode == "" {
+		config.CaddyMode = CaddyModeCompose
+	}
+	if !config.CaddyMode.valid() {
+		return Config{}, fmt.Errorf("caddy_mode must be compose or systemd")
 	}
 	if !pathWithin(config.StateDir, "/var/lib/dirextalk-updater") {
 		return Config{}, fmt.Errorf("state_dir must be under /var/lib/dirextalk-updater")

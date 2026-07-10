@@ -18,6 +18,21 @@ func TestLoadConfigAcceptsOnlyUpdaterOwnedPaths(t *testing.T) {
 	if config.StateDir != "/var/lib/dirextalk-updater" || config.SocketPath != "/run/dirextalk-updater/http.sock" {
 		t.Fatalf("unexpected config: %#v", config)
 	}
+	if config.CaddyMode != CaddyModeCompose {
+		t.Fatalf("legacy config did not default to compose Caddy: %#v", config)
+	}
+}
+
+func TestLoadConfigAcceptsOnlyFixedCaddyModes(t *testing.T) {
+	for _, mode := range []CaddyMode{CaddyModeCompose, CaddyModeSystemd} {
+		config, err := LoadConfig(strings.NewReader(`{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","caddy_mode":"` + string(mode) + `"}`))
+		if err != nil || config.CaddyMode != mode {
+			t.Fatalf("mode %q rejected: config=%#v err=%v", mode, config, err)
+		}
+	}
+	if _, err := LoadConfig(strings.NewReader(`{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","caddy_mode":"systemd:attacker.service"}`)); err == nil {
+		t.Fatal("unknown Caddy mode was accepted")
+	}
 }
 
 func TestLoadConfigRejectsInfrastructureAndUnknownFields(t *testing.T) {

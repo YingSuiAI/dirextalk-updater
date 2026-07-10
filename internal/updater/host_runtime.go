@@ -94,9 +94,13 @@ type ComposeRuntime struct {
 	backups      *BackupStore
 	httpClient   *http.Client
 	publicHealth func(context.Context, string) (runtimeHealth, error)
+	caddyMode    CaddyMode
 }
 
-func NewComposeRuntime() *ComposeRuntime {
+func NewComposeRuntime(caddyMode CaddyMode) (*ComposeRuntime, error) {
+	if !caddyMode.valid() {
+		return nil, fmt.Errorf("Caddy mode %q is not supported", caddyMode)
+	}
 	paths := composeRuntimePaths{
 		composeFile:       fixedComposeDir + "/docker-compose.yml",
 		envFile:           fixedComposeDir + "/.env",
@@ -112,10 +116,10 @@ func NewComposeRuntime() *ComposeRuntime {
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	})
+	}, caddyMode), nil
 }
 
-func newComposeRuntime(paths composeRuntimePaths, runner hostCommandRunner, httpClient *http.Client) *ComposeRuntime {
+func newComposeRuntime(paths composeRuntimePaths, runner hostCommandRunner, httpClient *http.Client, caddyMode CaddyMode) *ComposeRuntime {
 	if paths.now == nil {
 		paths.now = time.Now
 	}
@@ -139,6 +143,7 @@ func newComposeRuntime(paths composeRuntimePaths, runner hostCommandRunner, http
 		runner:     runner,
 		backups:    NewBackupStore(paths.backupRoot),
 		httpClient: httpClient,
+		caddyMode:  caddyMode,
 	}
 	runtime.publicHealth = runtime.fetchPublicHealth
 	return runtime
@@ -443,8 +448,17 @@ func (runtime *ComposeRuntime) RepairWatchdog(ctx context.Context) error {
 	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--pull", "never", "message-server")...); err != nil {
 		return fmt.Errorf("start watchdog message-server: %w", err)
 	}
-	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--pull", "never", "caddy")...); err != nil {
-		return fmt.Errorf("start watchdog Caddy: %w", err)
+	switch runtime.caddyMode {
+	case CaddyModeCompose:
+		if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--pull", "never", "caddy")...); err != nil {
+			return fmt.Errorf("start watchdog Compose Caddy: %w", err)
+		}
+	case CaddyModeSystemd:
+		if err := runtime.runner.Run(ctx, nil, io.Discard, "systemctl", "start", "caddy.service"); err != nil {
+			return fmt.Errorf("start watchdog systemd Caddy: %w", err)
+		}
+	default:
+		return fmt.Errorf("configured Caddy mode is invalid")
 	}
 	consecutive := 0
 	var lastErr error
@@ -689,6 +703,13 @@ func (runtime *ComposeRuntime) checkCurrentHealth(ctx context.Context, version, 
 }
 
 func (runtime *ComposeRuntime) checkCurrentHealthWithMode(ctx context.Context, version, digest string, mode healthValidationMode) (runtimeHealth, error) {
+	if runtime.caddyMode == CaddyModeSystemd {
+		if err := runtime.runner.Run(ctx, nil, io.Discard, "systemctl", "is-active", "--quiet", "caddy.service"); err != nil {
+			return runtimeHealth{}, fmt.Errorf("systemd Caddy service is unavailable")
+		}
+	} else if runtime.caddyMode != CaddyModeCompose {
+		return runtimeHealth{}, fmt.Errorf("configured Caddy mode is invalid")
+	}
 	containerState, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", composeContainerName("message-server"))
 	if err != nil {
 		return runtimeHealth{}, err

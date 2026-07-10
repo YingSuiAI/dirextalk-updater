@@ -70,7 +70,7 @@ func TestUbuntuComposeBackupUpgradeAndRollback(t *testing.T) {
 		healthInterval:    time.Second,
 		sleep:             sleepContext,
 	}
-	runtime := newComposeRuntime(paths, runner, nil)
+	runtime := newComposeRuntime(paths, runner, nil, CaddyModeCompose)
 	runtime.publicHealth = func(ctx context.Context, _ string) (runtimeHealth, error) {
 		return runtime.inspectHealth(ctx)
 	}

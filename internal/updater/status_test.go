@@ -22,7 +22,7 @@ func TestControlStatusRequiresAuthAndRejectsUnknownOrInfrastructureFields(t *tes
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("expected status auth rejection, got %d: %s", unauthorized.Code, unauthorized.Body.String())
 	}
-	for _, field := range []string{"image", "digest", "compose_path", "service", "instance_id", "shell", "unknown"} {
+	for _, field := range []string{"image", "digest", "compose_path", "service", "instance_id", "shell", "caddy_mode", "unknown"} {
 		body := strings.TrimSuffix(compatibleStatusRequest, "}") + fmt.Sprintf(`,"%s":"attacker"}`, field)
 		response := postJSON(t, service.Handler(), controlStatusPath, body, testControlToken, "")
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "unknown field") {

@@ -29,7 +29,7 @@ func TestControlJobCreationRequiresControlTokenAndRejectsInfrastructureFields(t 
 		t.Fatalf("expected control auth rejection, got %d: %s", response.Code, response.Body.String())
 	}
 
-	for _, field := range []string{"shell", "compose_path", "service", "image", "digest"} {
+	for _, field := range []string{"shell", "compose_path", "service", "image", "digest", "caddy_mode"} {
 		body := strings.TrimSuffix(`{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, "}") + `,"` + field + `":"attacker"}`
 		response = postJSON(t, service.Handler(), controlJobsPath, body, testControlToken, "")
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "unknown field") {

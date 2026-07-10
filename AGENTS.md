@@ -18,6 +18,9 @@ the application is down.
 ## Safety Contract
 
 - Keep the control API on its Unix socket. Do not add a TCP listener.
+- Caddy topology is selected only by the root-owned fixed enum `compose` or
+  `systemd`; systemd mode may operate only `caddy.service`. Never accept a
+  service name or Caddy mode through the control API.
 - The daemon is a root host-operation boundary. Require EUID 0 and a
   root-owned control-token regular file with mode exactly `0600`.
 - Treat the control token and per-job bearer tokens as secrets.

@@ -62,7 +62,10 @@ func runServer(configPath string) error {
 		return err
 	}
 	store := updater.NewStateStore(filepath.Join(config.StateDir, "runtime.json"))
-	runtime := updater.NewComposeRuntime()
+	runtime, err := updater.NewComposeRuntime(config.CaddyMode)
+	if err != nil {
+		return err
+	}
 	if err := runtime.Recover(context.Background()); err != nil {
 		return fmt.Errorf("recover updater backup state: %w", err)
 	}
@@ -103,12 +106,7 @@ func runServer(configPath string) error {
 }
 
 func loadRuntimeConfig(configPath string) (updater.Config, string, error) {
-	configFile, err := os.Open(configPath)
-	if err != nil {
-		return updater.Config{}, "", fmt.Errorf("open config: %w", err)
-	}
-	config, err := updater.LoadConfig(configFile)
-	_ = configFile.Close()
+	config, err := updater.LoadConfigFile(configPath)
 	if err != nil {
 		return updater.Config{}, "", err
 	}

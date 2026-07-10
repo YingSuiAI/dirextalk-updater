@@ -43,7 +43,8 @@ The default config is `/etc/dirextalk-updater/config.json`:
   "schema_version": 1,
   "state_dir": "/var/lib/dirextalk-updater",
   "socket_path": "/run/dirextalk-updater/http.sock",
-  "control_token_file": "/etc/dirextalk-updater/control-token"
+  "control_token_file": "/etc/dirextalk-updater/control-token",
+  "caddy_mode": "compose"
 }
 ```
 
@@ -51,6 +52,11 @@ Start the daemon as root with `dirextalk-updater -config <path> serve`. State
 is stored with restrictive permissions and atomic replacement. The control
 token must be a root-owned regular file with permissions exactly `0600`; a
 non-root runtime fails closed.
+The config file has the same root ownership and exact `0600` requirement and
+must be a regular non-symlink file.
+`caddy_mode` is the fixed enum `compose` or `systemd`; omitted legacy configs
+default to `compose`. Systemd mode can operate only `caddy.service`. This mode
+comes only from the root-owned config and is never accepted by the API.
 
 The frozen v1 Unix API prefix is `/_dirextalk/updater/v1/`. It includes control
 routes for release discovery, status, desired state, and job creation, plus a
@@ -105,6 +111,8 @@ observations, uses at most three repair attempts in ten minutes, and enters a
 Docker, PostgreSQL, message-server, and Caddy in that order using the already
 configured local tag-and-digest image. It never resolves a Release, pulls
 `latest`, rotates a backup, or runs a migration.
+In `systemd` mode the PostgreSQL and message-server steps remain in the fixed
+Compose project while Caddy observation and repair use only `caddy.service`.
 
 ## Release assets
 

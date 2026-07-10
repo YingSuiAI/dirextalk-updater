@@ -458,6 +458,81 @@ func TestComposeRuntimeWatchdogRepairUsesPinnedLocalImageAndFixedOrder(t *testin
 	}
 }
 
+func TestNewComposeRuntimeRejectsUnknownCaddyMode(t *testing.T) {
+	if _, err := NewComposeRuntime(CaddyMode("attacker.service")); err == nil {
+		t.Fatal("runtime accepted an unknown Caddy mode")
+	}
+}
+
+func TestSystemdCaddyModeRepairsHostCaddyWithoutComposeService(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{failContains: "is-active --quiet caddy.service"}
+	runtime := newTestComposeRuntimeWithCaddyMode(paths, runner, CaddyModeSystemd)
+	if err := runtime.ObserveWatchdog(context.Background()); err == nil {
+		t.Fatal("inactive host Caddy was reported healthy")
+	}
+	runner.failContains = ""
+	runner.calls = nil
+	if err := runtime.RepairWatchdog(context.Background()); err != nil {
+		t.Fatalf("repair systemd Caddy: %v", err)
+	}
+	assertCallSequence(t, runner.calls, []string{
+		"systemctl start docker.service",
+		" up -d --no-deps --pull never postgres",
+		" up -d --no-deps --pull never message-server",
+		"systemctl start caddy.service",
+		"systemctl is-active --quiet caddy.service",
+		"{{.State.Status}}",
+	})
+	joined := strings.Join(runner.calls, "\n")
+	if strings.Contains(joined, "up -d --no-deps --pull never caddy") {
+		t.Fatalf("systemd mode attempted a Compose Caddy service: %s", joined)
+	}
+}
+
+func TestSystemdCaddyFailureConsumesWatchdogBudgetAndDegrades(t *testing.T) {
+	t.Parallel()
+	store := NewStateStore(t.TempDir() + "/runtime.json")
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{failContains: "start caddy.service", healthJSON: `{"status":"down"}`}
+	runtime := newTestComposeRuntimeWithCaddyMode(paths, runner, CaddyModeSystemd)
+	watchdog := NewWatchdog(store, runtime)
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	watchdog.now = func() time.Time { return now }
+	for attempt := 0; attempt < watchdogMaxAttempts; attempt++ {
+		for observation := 0; observation < watchdogObservationThreshold; observation++ {
+			_ = watchdog.Reconcile(context.Background())
+		}
+		now = now.Add(time.Minute)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Watchdog.Status != WatchdogDegraded || state.Watchdog.ErrorCode != "repair_failed" || state.Watchdog.CooldownUntil.IsZero() {
+		t.Fatalf("systemd Caddy repair failures did not degrade watchdog: %#v", state.Watchdog)
+	}
+}
+
+func TestSystemdCaddyModeGuardsReleaseHealthChecks(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{
+		failContains: "is-active --quiet caddy.service",
+		imageRef:     "dirextalk/message-server:v1.1.0@sha256:" + strings.Repeat("a", 64),
+		healthJSON:   validManifestHealthJSON(),
+	}
+	runtime := newTestComposeRuntimeWithCaddyMode(paths, runner, CaddyModeSystemd)
+	manifest, err := ValidateManifest([]byte(validManifestJSON()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.CheckTarget(context.Background(), manifest); err == nil {
+		t.Fatal("release health ignored inactive host Caddy")
+	}
+}
+
 func TestComposeRuntimeWatchdogFailsClosedWhenPinnedImageIsNotLocal(t *testing.T) {
 	t.Parallel()
 	paths := testHostPaths(t, t.TempDir())
@@ -607,7 +682,11 @@ func testBackupPlan(manifest Manifest, currentVersion, sourceDigest string) Plan
 }
 
 func newTestComposeRuntime(paths composeRuntimePaths, runner *fakeHostCommandRunner) *ComposeRuntime {
-	runtime := newComposeRuntime(paths, runner, nil)
+	return newTestComposeRuntimeWithCaddyMode(paths, runner, CaddyModeCompose)
+}
+
+func newTestComposeRuntimeWithCaddyMode(paths composeRuntimePaths, runner *fakeHostCommandRunner, mode CaddyMode) *ComposeRuntime {
+	runtime := newComposeRuntime(paths, runner, nil, mode)
 	runtime.publicHealth = func(context.Context, string) (runtimeHealth, error) {
 		healthJSON := runner.healthJSON
 		if healthJSON == "" {
@@ -620,6 +699,10 @@ func newTestComposeRuntime(paths composeRuntimePaths, runner *fakeHostCommandRun
 		return health, nil
 	}
 	return runtime
+}
+
+func validManifestHealthJSON() string {
+	return `{"status":"ok","version":"v1.1.0","schema_version":2,"schema_compat_version":1}`
 }
 
 func writeFakeTar(output io.Writer, value string) error {
