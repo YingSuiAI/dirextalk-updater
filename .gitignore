@@ -1,0 +1,5 @@
+/dist/
+/dirextalk-updater
+*.exe
+*.test
+coverage.out

@@ -1,4 +1,4 @@
-module github.com/YingSuiAI/dirextalk-deployer/updater
+module github.com/YingSuiAI/dirextalk-updater
 
 go 1.24
 

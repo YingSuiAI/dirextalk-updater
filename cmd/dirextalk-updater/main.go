@@ -13,7 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/YingSuiAI/dirextalk-deployer/updater/internal/updater"
+	"github.com/YingSuiAI/dirextalk-updater/internal/buildinfo"
+	"github.com/YingSuiAI/dirextalk-updater/internal/updater"
 )
 
 func main() {
@@ -26,11 +27,19 @@ func main() {
 	var err error
 	switch command {
 	case "serve":
+		if err = updater.CheckSupportedHost(); err != nil {
+			break
+		}
 		err = runServer(*configPath)
 	case "resolve-release":
 		err = resolveRelease()
 	case "trigger-discovery":
+		if err = updater.CheckSupportedHost(); err != nil {
+			break
+		}
 		err = triggerDiscovery(*configPath)
+	case "version":
+		err = writeVersion()
 	default:
 		err = fmt.Errorf("unknown command %q", command)
 	}
@@ -38,6 +47,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "dirextalk-updater:", err)
 		os.Exit(1)
 	}
+}
+
+func writeVersion() error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(buildinfo.Current())
 }
 
 func runServer(configPath string) error {

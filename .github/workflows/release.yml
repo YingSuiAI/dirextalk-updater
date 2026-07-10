@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      - name: Verify
+        run: |
+          go mod verify
+          test -z "$(gofmt -l .)"
+          go test ./...
+          go test -race ./...
+          go vet ./...
+      - name: Build release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          LDFLAGS="-s -w -X github.com/YingSuiAI/dirextalk-updater/internal/buildinfo.Version=$VERSION -X github.com/YingSuiAI/dirextalk-updater/internal/buildinfo.Commit=$COMMIT -X github.com/YingSuiAI/dirextalk-updater/internal/buildinfo.BuildTime=$BUILD_TIME"
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o dist/dirextalk-updater-linux-amd64 ./cmd/dirextalk-updater
+          ./dist/dirextalk-updater-linux-amd64 version | grep -F "\"version\": \"$VERSION\""
+          ./dist/dirextalk-updater-linux-amd64 version | grep -F "\"commit\": \"$COMMIT\""
+          go run -ldflags "$LDFLAGS" ./cmd/release-artifacts -binary dist/dirextalk-updater-linux-amd64 -output dist
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$VERSION" \
+            dist/dirextalk-updater-linux-amd64 \
+            dist/dirextalk-updater-linux-amd64.sha256 \
+            dist/dirextalk-updater-release.json \
+            --verify-tag --title "$VERSION" --generate-notes

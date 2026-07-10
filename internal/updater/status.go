@@ -193,20 +193,17 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 		}
 		return status, nil
 	}
-	if !status.UpdateAvailable {
-		if current.Equal(latest) {
-			status.Compatibility = CompatibilityCompatible
-			status.Reasons = append(status.Reasons, "up_to_date")
-		} else {
-			status.Compatibility = CompatibilityIncompatible
-			status.Reasons = append(status.Reasons, "current_version_newer")
-		}
+	if current.GreaterThan(latest) {
+		status.Compatibility = CompatibilityIncompatible
+		status.Reasons = append(status.Reasons, "current_version_newer")
 		return status, nil
 	}
 	compatible := true
-	if err := manifest.ValidateUpgradeFrom(input.CurrentVersion); err != nil {
-		compatible = false
-		status.Reasons = append(status.Reasons, "upgrade_path_unsupported")
+	if status.UpdateAvailable {
+		if err := manifest.ValidateUpgradeFrom(input.CurrentVersion); err != nil {
+			compatible = false
+			status.Reasons = append(status.Reasons, "upgrade_path_unsupported")
+		}
 	}
 	if input.CurrentSchemaVersion < manifest.SchemaCompatVersion || input.CurrentSchemaCompatVersion > manifest.SchemaVersion {
 		compatible = false
@@ -228,12 +225,36 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 		return status, nil
 	}
 	status.Compatibility = CompatibilityCompatible
+	if current.Equal(latest) {
+		status.Reasons = append(status.Reasons, "up_to_date")
+		return status, nil
+	}
+	desiredStateEligible := state.DesiredState == DesiredRunning
+	operationInProgress := hasActiveJob(state)
+	if !desiredStateEligible {
+		status.Reasons = append(status.Reasons, "desired_state_not_running")
+	}
+	if operationInProgress {
+		status.Reasons = append(status.Reasons, "operation_in_progress")
+	}
+	if !desiredStateEligible || operationInProgress {
+		return status, nil
+	}
 	return status, &Plan{
 		Manifest:       *manifest,
 		ManifestDigest: state.Discovery.ManifestDigest,
 		CurrentVersion: input.CurrentVersion,
 		ExpiresAt:      now.Add(statusPlanLifetime),
 	}
+}
+
+func hasActiveJob(state RuntimeState) bool {
+	for _, job := range state.Jobs {
+		if job.Status == JobQueued {
+			return true
+		}
+	}
+	return false
 }
 
 func discoveryReason(status DiscoveryStatus) string {

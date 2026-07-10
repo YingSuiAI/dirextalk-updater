@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -135,6 +136,114 @@ func TestIdempotentReplayReturnsSameJobAndSurvivesRestart(t *testing.T) {
 	decodeResponse(t, replay, &replayTicket)
 	if replayTicket.JobID != first.JobID {
 		t.Fatalf("restart lost idempotency mapping: %#v", replayTicket)
+	}
+}
+
+func TestFirstJobTransitionsDesiredStateAndBlocksDifferentKey(t *testing.T) {
+	service, store := newTestService(t)
+	first := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("create first job: %d %s", first.Code, first.Body.String())
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.DesiredState != DesiredUpgrading || len(state.Jobs) != 1 {
+		t.Fatalf("job and desired state were not committed together: %#v", state)
+	}
+	blocked := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-2","confirm":"apply_release_change"}`, testControlToken, "")
+	if blocked.Code != http.StatusConflict || !strings.Contains(blocked.Body.String(), "operation_in_progress") {
+		t.Fatalf("second key was not blocked: %d %s", blocked.Code, blocked.Body.String())
+	}
+}
+
+func TestNewJobIsRejectedForEveryNonRunningDesiredState(t *testing.T) {
+	for _, desired := range []DesiredState{DesiredUpgrading, DesiredMaintenance, DesiredDeprovisioned} {
+		t.Run(string(desired), func(t *testing.T) {
+			service, store := newTestService(t)
+			state, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			state.DesiredState = desired
+			if err := store.Save(context.Background(), state); err != nil {
+				t.Fatal(err)
+			}
+			response := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")
+			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "desired_state_not_running") {
+				t.Fatalf("desired state %s accepted job: %d %s", desired, response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestConcurrentDifferentKeysCreateOnlyOneJob(t *testing.T) {
+	service, store := newTestService(t)
+	bodies := []string{
+		`{"plan_token":"test-plan-token","idempotency_key":"concurrent-1","confirm":"apply_release_change"}`,
+		`{"plan_token":"test-plan-token","idempotency_key":"concurrent-2","confirm":"apply_release_change"}`,
+	}
+	responses := make([]*httptest.ResponseRecorder, len(bodies))
+	var wait sync.WaitGroup
+	for index := range bodies {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			responses[index] = postJSON(t, service.Handler(), controlJobsPath, bodies[index], testControlToken, "")
+		}(index)
+	}
+	wait.Wait()
+	accepted := 0
+	conflicts := 0
+	for _, response := range responses {
+		switch response.Code {
+		case http.StatusAccepted:
+			accepted++
+		case http.StatusConflict:
+			if !strings.Contains(response.Body.String(), "operation_in_progress") {
+				t.Fatalf("unexpected conflict: %s", response.Body.String())
+			}
+			conflicts++
+		default:
+			t.Fatalf("unexpected concurrent response: %d %s", response.Code, response.Body.String())
+		}
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted != 1 || conflicts != 1 || len(state.Jobs) != 1 || state.DesiredState != DesiredUpgrading {
+		t.Fatalf("concurrent apply invariant failed: accepted=%d conflicts=%d state=%#v", accepted, conflicts, state)
+	}
+}
+
+func TestIdempotentReplaySucceedsAfterPlanExpiryButDifferentKeyFails(t *testing.T) {
+	service, store := newTestService(t)
+	firstResponse := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")
+	var first JobTicket
+	decodeResponse(t, firstResponse, &first)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	planHash := tokenHash(testPlanToken)
+	plan := state.Plans[planHash]
+	plan.ExpiresAt = time.Now().Add(-time.Minute)
+	state.Plans[planHash] = plan
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+
+	replayResponse := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")
+	var replay JobTicket
+	decodeResponse(t, replayResponse, &replay)
+	if replay.JobID != first.JobID || replay.JobToken == first.JobToken {
+		t.Fatalf("expired-plan replay did not recover job: first=%#v replay=%#v", first, replay)
+	}
+	differentKey := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-2","confirm":"apply_release_change"}`, testControlToken, "")
+	if differentKey.Code != http.StatusConflict || !strings.Contains(differentKey.Body.String(), "plan_invalid_or_expired") {
+		t.Fatalf("expired plan authorized a new key: %d %s", differentKey.Code, differentKey.Body.String())
 	}
 }
 

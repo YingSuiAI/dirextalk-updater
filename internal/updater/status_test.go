@@ -114,6 +114,9 @@ func TestControlStatusCompatibilityAndDiscoveryStates(t *testing.T) {
 		wantLatest           string
 	}{
 		{"up to date", DiscoveryFresh, `{"current_version":"v1.1.0","current_schema_version":2,"current_schema_compat_version":1,"client_version":"1.2.3"}`, true, false, CompatibilityCompatible, "up_to_date", "v1.1.0"},
+		{"up to date but client too old", DiscoveryFresh, `{"current_version":"v1.1.0","current_schema_version":2,"current_schema_compat_version":1,"client_version":"v0.9.0"}`, true, false, CompatibilityIncompatible, "client_too_old", "v1.1.0"},
+		{"up to date but client too new", DiscoveryFresh, `{"current_version":"v1.1.0","current_schema_version":2,"current_schema_compat_version":1,"client_version":"v2.0.0"}`, true, false, CompatibilityIncompatible, "client_too_new", "v1.1.0"},
+		{"up to date but schema incompatible", DiscoveryFresh, `{"current_version":"v1.1.0","current_schema_version":3,"current_schema_compat_version":3,"client_version":"v1.2.3"}`, true, false, CompatibilityIncompatible, "schema_incompatible", "v1.1.0"},
 		{"client unknown", DiscoveryFresh, `{"current_version":"v1.0.0","current_schema_version":1,"current_schema_compat_version":1,"client_version":""}`, true, true, CompatibilityUnknown, "client_version_unknown", "v1.1.0"},
 		{"client too old", DiscoveryFresh, `{"current_version":"v1.0.0","current_schema_version":1,"current_schema_compat_version":1,"client_version":"v0.9.0"}`, true, true, CompatibilityIncompatible, "client_too_old", "v1.1.0"},
 		{"client too new", DiscoveryFresh, `{"current_version":"v1.0.0","current_schema_version":1,"current_schema_compat_version":1,"client_version":"v2.0.0"}`, true, true, CompatibilityIncompatible, "client_too_new", "v1.1.0"},
@@ -144,6 +147,54 @@ func TestControlStatusCompatibilityAndDiscoveryStates(t *testing.T) {
 				t.Fatalf("unexpected operations: %#v", got.Operations)
 			}
 		})
+	}
+}
+
+func TestControlStatusDoesNotOfferOperationWhenDesiredStateIsNotRunning(t *testing.T) {
+	for _, desired := range []DesiredState{DesiredUpgrading, DesiredMaintenance, DesiredDeprovisioned} {
+		t.Run(string(desired), func(t *testing.T) {
+			service, store, _ := newStatusTestService(t, DiscoveryFresh)
+			state, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			state.DesiredState = desired
+			if err := store.Save(context.Background(), state); err != nil {
+				t.Fatal(err)
+			}
+			response := postJSON(t, service.Handler(), controlStatusPath, compatibleStatusRequest, testControlToken, "")
+			var got StatusResponse
+			decodeResponse(t, response, &got)
+			if got.Compatibility != CompatibilityCompatible || len(got.Operations) != 0 || !containsReason(got.Reasons, "desired_state_not_running") {
+				t.Fatalf("unsafe desired state offered an operation: %#v", got)
+			}
+		})
+	}
+}
+
+func TestControlStatusDoesNotOfferOperationWhileAJobIsActive(t *testing.T) {
+	service, store, _ := newStatusTestService(t, DiscoveryFresh)
+	initial := postJSON(t, service.Handler(), controlStatusPath, compatibleStatusRequest, testControlToken, "")
+	var initialStatus StatusResponse
+	decodeResponse(t, initial, &initialStatus)
+	applyBody := fmt.Sprintf(`{"plan_token":%q,"idempotency_key":"active-job","confirm":"apply_release_change"}`, initialStatus.Operations[0].PlanToken)
+	apply := postJSON(t, service.Handler(), controlJobsPath, applyBody, testControlToken, "")
+	if apply.Code != http.StatusAccepted {
+		t.Fatalf("create active job: %d %s", apply.Code, apply.Body.String())
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.DesiredState = DesiredRunning
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	response := postJSON(t, service.Handler(), controlStatusPath, compatibleStatusRequest, testControlToken, "")
+	var got StatusResponse
+	decodeResponse(t, response, &got)
+	if got.Compatibility != CompatibilityCompatible || len(got.Operations) != 0 || !containsReason(got.Reasons, "operation_in_progress") {
+		t.Fatalf("active job did not gate operation: %#v", got)
 	}
 }
 

@@ -223,10 +223,6 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 	var ticket JobTicket
 	var rejection *mutationRejection
 	err := service.store.Update(request.Context(), func(state *RuntimeState) error {
-		plan, ok := state.Plans[planHash]
-		if !ok || !plan.ExpiresAt.After(service.now()) {
-			return rejectMutation(http.StatusConflict, "plan_invalid_or_expired")
-		}
 		if existingID, exists := state.Idempotency[input.IdempotencyKey]; exists {
 			job, jobExists := state.Jobs[existingID]
 			if !jobExists {
@@ -244,6 +240,16 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 			state.Jobs[job.ID] = job
 			ticket = JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}
 			return nil
+		}
+		plan, ok := state.Plans[planHash]
+		if !ok || !plan.ExpiresAt.After(service.now()) {
+			return rejectMutation(http.StatusConflict, "plan_invalid_or_expired")
+		}
+		if hasActiveJob(*state) {
+			return rejectMutation(http.StatusConflict, "operation_in_progress")
+		}
+		if state.DesiredState != DesiredRunning {
+			return rejectMutation(http.StatusConflict, "desired_state_not_running")
 		}
 
 		jobIDToken, tokenErr := randomToken(18)
@@ -269,6 +275,7 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		}
 		state.Jobs[job.ID] = job
 		state.Idempotency[input.IdempotencyKey] = job.ID
+		state.DesiredState = DesiredUpgrading
 		ticket = JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}
 		return nil
 	})
