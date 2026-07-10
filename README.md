@@ -68,6 +68,11 @@ Both the index and its embedded manifests use deterministic compact JSON so
 their digests can be rechecked after state persistence. Formal source releases
 must remain in the index. The only unindexed bootstrap source is the explicit
 `v0.15.2 -> v1.0.0` legacy edge.
+That bootstrap edge alone may accept the legacy `{\"status\":\"ok\"}` health
+shape after the canonical pinned image and edge digest match. Its backup records
+an explicit schema `1/1` assumption so only that legacy recovery can use the
+same narrow health check. Watchdog, formal targets, and formal restores remain
+on the complete version/schema health contract.
 The `upgrading` desired state is internal to the job transaction, and external
 desired-state changes are rejected while a job is active.
 

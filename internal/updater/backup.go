@@ -43,15 +43,16 @@ type BackupArtifact struct {
 }
 
 type BackupMetadata struct {
-	SchemaVersion       int              `json:"schema_version"`
-	JobID               string           `json:"job_id"`
-	Version             string           `json:"version"`
-	ImageDigest         string           `json:"image_digest"`
-	ImageRef            string           `json:"image_ref"`
-	DatabaseSchema      int              `json:"database_schema"`
-	SchemaCompatVersion int              `json:"schema_compat_version"`
-	CreatedAt           time.Time        `json:"created_at"`
-	Artifacts           []BackupArtifact `json:"artifacts"`
+	SchemaVersion             int              `json:"schema_version"`
+	JobID                     string           `json:"job_id"`
+	Version                   string           `json:"version"`
+	ImageDigest               string           `json:"image_digest"`
+	ImageRef                  string           `json:"image_ref"`
+	DatabaseSchema            int              `json:"database_schema"`
+	SchemaCompatVersion       int              `json:"schema_compat_version"`
+	LegacyBootstrapAssumption bool             `json:"legacy_bootstrap_assumption,omitempty"`
+	CreatedAt                 time.Time        `json:"created_at"`
+	Artifacts                 []BackupArtifact `json:"artifacts"`
 }
 
 type BackupStore struct {
@@ -320,6 +321,9 @@ func validateBackupMetadataShape(metadata BackupMetadata) error {
 	}
 	if metadata.DatabaseSchema < 1 || metadata.SchemaCompatVersion < 1 || metadata.SchemaCompatVersion > metadata.DatabaseSchema {
 		return fmt.Errorf("backup schema compatibility is invalid")
+	}
+	if metadata.LegacyBootstrapAssumption && (metadata.Version != legacyInitialVersion || metadata.DatabaseSchema != 1 || metadata.SchemaCompatVersion != 1) {
+		return fmt.Errorf("legacy bootstrap backup assumption is invalid")
 	}
 	if metadata.CreatedAt.IsZero() || !metadata.CreatedAt.Equal(metadata.CreatedAt.UTC()) {
 		return fmt.Errorf("backup created_at must be UTC")

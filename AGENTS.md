@@ -39,6 +39,10 @@ the application is down.
   compatibility also fail closed. Every edge binds the exact source image
   digest, and an indirect upgrade must have one unambiguous ordered path. Plan registration atomically rechecks
   discovery freshness and host eligibility before returning an operation.
+- Keep the legacy minimal-health exception limited to the trusted
+  `v0.15.2 -> v1.0.0` bootstrap source and its explicitly marked recovery
+  point, after canonical image and exact edge digest verification. Never apply
+  it to watchdog, formal targets, or formal restores.
 
 ## Change Workflow
 

@@ -59,6 +59,10 @@ latest 的路径必须唯一，并在创建任务前把完整有序链固化到 
 index 及其内嵌 manifest 均使用确定性的 compact JSON，持久化后仍会复核摘要。
 正式来源版本必须保留在 index 中；唯一允许未收录来源的 bootstrap 边是显式的
 `v0.15.2 -> v1.0.0` legacy edge。
+只有这条 bootstrap 边可在 canonical 固定镜像和 edge digest 已一致后接受旧版
+`{\"status\":\"ok\"}` 健康结构；备份会显式记录 schema `1/1` 假设，因此仅该
+legacy 恢复点可复用相同窄门禁。watchdog、正式目标及正式版本恢复仍要求完整的
+版本和 schema 健康信息。
 
 任务在执行任何宿主机变更前都会先持久化检查点。updater 会短暂停止
 message-server，生成一致的 PostgreSQL custom dump、message 配置/数据归档和

@@ -71,6 +71,23 @@ func TestBackupStoreRejectsCorruptStagingWithoutReplacingCurrent(t *testing.T) {
 	}
 }
 
+func TestBackupMetadataRejectsLegacyAssumptionForFormalRelease(t *testing.T) {
+	t.Parallel()
+	store := NewBackupStore(t.TempDir())
+	staging := stageCompleteBackup(t, store, "job_formal", "v1.0.0")
+	if err := store.Commit(context.Background(), staging); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := store.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.LegacyBootstrapAssumption = true
+	if err := validateBackupMetadataShape(metadata); err == nil {
+		t.Fatal("formal backup accepted legacy bootstrap assumption")
+	}
+}
+
 func TestBackupStoreRepairsRotationBeforeReturningFsyncFailure(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {

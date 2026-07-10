@@ -166,11 +166,12 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 	if err := progress(JobValidating); err != nil {
 		return BackupMetadata{}, err
 	}
-	version, digest, health, err := runtime.ensureSourceReady(ctx, job.CurrentVersion)
+	step := plan.ReleaseChain[0]
+	version, digest, health, err := runtime.ensureSourceReady(ctx, job.CurrentVersion, step)
 	if err != nil {
 		return BackupMetadata{}, err
 	}
-	if !digestAllowed(digest, plan.ReleaseChain[0].SourceImageDigests) {
+	if !digestAllowed(digest, step.SourceImageDigests) {
 		return BackupMetadata{}, errUntrustedSourceImageDigest
 	}
 	if err := progress(JobBackingUp); err != nil {
@@ -213,7 +214,7 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 		}
 		return archiveDirectory(runtime.paths.p2pDir, filepath.Join(staging, "p2p.tar"))
 	}()
-	_, _, _, restartErr := runtime.ensureSourceReady(ctx, job.CurrentVersion)
+	_, _, _, restartErr := runtime.ensureSourceReady(ctx, job.CurrentVersion, step)
 	if restartErr != nil {
 		return BackupMetadata{}, serviceUnavailableError{cause: errors.Join(backupErr, fmt.Errorf("restore source message-server after backup: %w", restartErr))}
 	}
@@ -221,14 +222,15 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 		return BackupMetadata{}, backupErr
 	}
 	metadata = BackupMetadata{
-		SchemaVersion:       BackupMetadataSchemaVersion,
-		JobID:               job.ID,
-		Version:             version,
-		ImageDigest:         digest,
-		ImageRef:            pinnedImageRef(version, digest),
-		DatabaseSchema:      health.SchemaVersion,
-		SchemaCompatVersion: health.SchemaCompatVersion,
-		CreatedAt:           runtime.paths.now().UTC(),
+		SchemaVersion:             BackupMetadataSchemaVersion,
+		JobID:                     job.ID,
+		Version:                   version,
+		ImageDigest:               digest,
+		ImageRef:                  pinnedImageRef(version, digest),
+		DatabaseSchema:            health.SchemaVersion,
+		SchemaCompatVersion:       health.SchemaCompatVersion,
+		LegacyBootstrapAssumption: isTrustedLegacyBootstrapStep(job.CurrentVersion, digest, step),
+		CreatedAt:                 runtime.paths.now().UTC(),
 	}
 	for _, name := range requiredBackupArtifacts {
 		path := filepath.Join(staging, name)
@@ -347,6 +349,9 @@ func (runtime *ComposeRuntime) RestoreBackup(ctx context.Context, recovery Backu
 }
 
 func (runtime *ComposeRuntime) CheckRestored(ctx context.Context, recovery BackupMetadata) error {
+	if recovery.LegacyBootstrapAssumption {
+		return runtime.waitExpectedWithMode(ctx, recovery.Version, recovery.ImageDigest, recovery.DatabaseSchema, recovery.SchemaCompatVersion, healthValidationLegacyBootstrapRestore)
+	}
 	return runtime.waitExpected(ctx, recovery.Version, recovery.ImageDigest, recovery.DatabaseSchema, recovery.SchemaCompatVersion)
 }
 
@@ -514,7 +519,7 @@ func (writer *watchdogEventWriter) Write(data []byte) (int, error) {
 	return original, nil
 }
 
-func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVersion string) (string, string, runtimeHealth, error) {
+func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVersion string, step ReleaseStep) (string, string, runtimeHealth, error) {
 	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
 	if err != nil {
 		return "", "", runtimeHealth{}, err
@@ -523,6 +528,13 @@ func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVe
 	if err != nil || version != expectedVersion {
 		return "", "", runtimeHealth{}, fmt.Errorf("pinned source image does not match the planned version")
 	}
+	if !digestAllowed(digest, step.SourceImageDigests) {
+		return "", "", runtimeHealth{}, errUntrustedSourceImageDigest
+	}
+	mode := healthValidationStrict
+	if isTrustedLegacyBootstrapStep(expectedVersion, digest, step) {
+		mode = healthValidationLegacyBootstrapSource
+	}
 	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "message-server")...); err != nil {
 		return "", "", runtimeHealth{}, serviceUnavailableError{cause: fmt.Errorf("start source message-server: %w", err)}
 	}
@@ -530,7 +542,7 @@ func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVe
 	var lastErr error
 	var health runtimeHealth
 	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
-		health, lastErr = runtime.checkCurrentHealth(ctx, version, digest)
+		health, lastErr = runtime.checkCurrentHealthWithMode(ctx, version, digest, mode)
 		if lastErr == nil {
 			consecutive++
 			if consecutive >= runtime.paths.healthConsecutive {
@@ -553,6 +565,42 @@ type runtimeHealth struct {
 	Version             string `json:"version"`
 	SchemaVersion       int    `json:"schema_version"`
 	SchemaCompatVersion int    `json:"schema_compat_version"`
+	exactMinimal        bool
+}
+
+func (health *runtimeHealth) UnmarshalJSON(data []byte) error {
+	type wireHealth struct {
+		Status              string `json:"status"`
+		Version             string `json:"version"`
+		SchemaVersion       int    `json:"schema_version"`
+		SchemaCompatVersion int    `json:"schema_compat_version"`
+	}
+	var wire wireHealth
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, hasStatus := fields["status"]
+	*health = runtimeHealth{
+		Status: wire.Status, Version: wire.Version, SchemaVersion: wire.SchemaVersion,
+		SchemaCompatVersion: wire.SchemaCompatVersion, exactMinimal: hasStatus && len(fields) == 1,
+	}
+	return nil
+}
+
+type healthValidationMode uint8
+
+const (
+	healthValidationStrict healthValidationMode = iota
+	healthValidationLegacyBootstrapSource
+	healthValidationLegacyBootstrapRestore
+)
+
+func isTrustedLegacyBootstrapStep(sourceVersion, sourceDigest string, step ReleaseStep) bool {
+	return sourceVersion == legacyInitialVersion && step.Manifest.Version == firstFormalVersion && digestAllowed(sourceDigest, step.SourceImageDigests)
 }
 
 type serviceUnavailableError struct {
@@ -582,16 +630,23 @@ func (runtime *ComposeRuntime) inspectHealth(ctx context.Context) (runtimeHealth
 	if err := decoder.Decode(&health); err != nil {
 		return runtimeHealth{}, fmt.Errorf("decode message-server health: %w", err)
 	}
+	if err := ensureJSONEOF(decoder, "message-server health"); err != nil {
+		return runtimeHealth{}, err
+	}
 	return health, nil
 }
 
 func (runtime *ComposeRuntime) waitExpected(ctx context.Context, version, digest string, schemaVersion, schemaCompatVersion int) error {
+	return runtime.waitExpectedWithMode(ctx, version, digest, schemaVersion, schemaCompatVersion, healthValidationStrict)
+}
+
+func (runtime *ComposeRuntime) waitExpectedWithMode(ctx context.Context, version, digest string, schemaVersion, schemaCompatVersion int, mode healthValidationMode) error {
 	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
 	defer cancel()
 	consecutive := 0
 	var lastErr error
 	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
-		lastErr = runtime.checkExpectedOnce(ctx, version, digest, schemaVersion, schemaCompatVersion)
+		lastErr = runtime.checkExpectedOnceWithMode(ctx, version, digest, schemaVersion, schemaCompatVersion, mode)
 		if lastErr == nil {
 			consecutive++
 			if consecutive >= runtime.paths.healthConsecutive {
@@ -610,7 +665,11 @@ func (runtime *ComposeRuntime) waitExpected(ctx context.Context, version, digest
 }
 
 func (runtime *ComposeRuntime) checkExpectedOnce(ctx context.Context, version, digest string, schemaVersion, schemaCompatVersion int) error {
-	health, err := runtime.checkCurrentHealth(ctx, version, digest)
+	return runtime.checkExpectedOnceWithMode(ctx, version, digest, schemaVersion, schemaCompatVersion, healthValidationStrict)
+}
+
+func (runtime *ComposeRuntime) checkExpectedOnceWithMode(ctx context.Context, version, digest string, schemaVersion, schemaCompatVersion int, mode healthValidationMode) error {
+	health, err := runtime.checkCurrentHealthWithMode(ctx, version, digest, mode)
 	if err != nil {
 		return err
 	}
@@ -626,6 +685,10 @@ func (runtime *ComposeRuntime) checkCurrentOnce(ctx context.Context, version, di
 }
 
 func (runtime *ComposeRuntime) checkCurrentHealth(ctx context.Context, version, digest string) (runtimeHealth, error) {
+	return runtime.checkCurrentHealthWithMode(ctx, version, digest, healthValidationStrict)
+}
+
+func (runtime *ComposeRuntime) checkCurrentHealthWithMode(ctx context.Context, version, digest string, mode healthValidationMode) (runtimeHealth, error) {
 	containerState, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", composeContainerName("message-server"))
 	if err != nil {
 		return runtimeHealth{}, err
@@ -652,7 +715,11 @@ func (runtime *ComposeRuntime) checkCurrentHealth(ctx context.Context, version, 
 	if err != nil {
 		return runtimeHealth{}, err
 	}
-	if health.Status != "ok" || !healthVersionMatches(version, health.Version) || health.SchemaVersion < 1 || health.SchemaCompatVersion < 1 || health.SchemaCompatVersion > health.SchemaVersion {
+	strictHealth := health.Status == "ok" && health.Version == version && health.SchemaVersion >= 1 && health.SchemaCompatVersion >= 1 && health.SchemaCompatVersion <= health.SchemaVersion
+	legacyFullHealth := health.Status == "ok" && healthVersionMatches(version, health.Version) && health.SchemaVersion >= 1 && health.SchemaCompatVersion >= 1 && health.SchemaCompatVersion <= health.SchemaVersion
+	legacyMinimalHealth := health.Status == "ok" && health.exactMinimal
+	legacyMode := mode == healthValidationLegacyBootstrapSource || mode == healthValidationLegacyBootstrapRestore
+	if !strictHealth && !(legacyMode && version == legacyInitialVersion && (legacyFullHealth || legacyMinimalHealth)) {
 		return runtimeHealth{}, fmt.Errorf("message-server build health does not match expected release")
 	}
 	domain, err := readEnvironmentValue(runtime.paths.envFile, "DOMAIN")
@@ -665,6 +732,9 @@ func (runtime *ComposeRuntime) checkCurrentHealth(ctx context.Context, version, 
 	}
 	if publicHealth != health {
 		return runtimeHealth{}, fmt.Errorf("Caddy public health does not match internal health")
+	}
+	if legacyMode && legacyMinimalHealth {
+		return runtimeHealth{Status: "ok", Version: legacyInitialVersion, SchemaVersion: 1, SchemaCompatVersion: 1}, nil
 	}
 	return health, nil
 }
@@ -696,6 +766,9 @@ func (runtime *ComposeRuntime) fetchPublicHealth(ctx context.Context, domain str
 	var health runtimeHealth
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 64*1024))
 	if err := decoder.Decode(&health); err != nil {
+		return runtimeHealth{}, err
+	}
+	if err := ensureJSONEOF(decoder, "public message-server health"); err != nil {
 		return runtimeHealth{}, err
 	}
 	return health, nil

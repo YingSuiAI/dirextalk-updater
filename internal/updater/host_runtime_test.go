@@ -80,7 +80,7 @@ func TestComposeRuntimeRejectsUntrustedSourceDigestBeforeStoppingOrRotatingBacku
 	}
 }
 
-func TestComposeRuntimeNormalizesOnlyLegacyBareHealthVersion(t *testing.T) {
+func TestComposeRuntimeAcceptsMinimalHealthOnlyForTrustedLegacyBootstrapPlan(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	paths := testHostPaths(t, root)
@@ -90,18 +90,122 @@ func TestComposeRuntimeNormalizesOnlyLegacyBareHealthVersion(t *testing.T) {
 	}
 	runner := &fakeHostCommandRunner{
 		imageRef:   pinnedImageRef(legacyInitialVersion, digest),
-		healthJSON: `{"status":"ok","version":"0.15.2","schema_version":1,"schema_compat_version":1}`,
+		healthJSON: `{"status":"ok"}`,
 	}
 	runtime := newTestComposeRuntime(paths, runner)
-	version, observedDigest, health, err := runtime.ensureSourceReady(context.Background(), legacyInitialVersion)
+	manifest, err := ValidateManifest([]byte(manifestJSONFor(firstFormalVersion, strings.Repeat("0", 64), ">=v0.15.2 <v1.0.0")))
 	if err != nil {
-		t.Fatalf("legacy bare health version was not normalized: %v", err)
+		t.Fatal(err)
 	}
-	if version != legacyInitialVersion || observedDigest != digest || health.Version != "0.15.2" {
-		t.Fatalf("unexpected legacy source identity: version=%s digest=%s health=%#v", version, observedDigest, health)
+	metadata, err := runtime.PrepareBackup(context.Background(), Job{ID: "job_legacy", CurrentVersion: legacyInitialVersion}, testBackupPlan(manifest, legacyInitialVersion, digest), ignoreProgress)
+	if err != nil {
+		t.Fatalf("trusted legacy minimal health was rejected: %v", err)
+	}
+	if metadata.Version != legacyInitialVersion || metadata.ImageDigest != digest || metadata.DatabaseSchema != 1 || metadata.SchemaCompatVersion != 1 {
+		t.Fatalf("legacy bootstrap assumption was not recorded explicitly: %#v", metadata)
 	}
 	if healthVersionMatches("v1.0.0", "1.0.0") {
 		t.Fatal("bare version normalization escaped the one legacy version")
+	}
+}
+
+func TestComposeRuntimeRejectsMinimalHealthOutsideTrustedLegacyBootstrap(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		version    string
+		healthJSON string
+	}{
+		{name: "formal source", version: "v1.0.0", healthJSON: `{"status":"ok"}`},
+		{name: "legacy non ok", version: legacyInitialVersion, healthJSON: `{"status":"down"}`},
+		{name: "legacy partial", version: legacyInitialVersion, healthJSON: `{"status":"ok","version":"0.15.2"}`},
+		{name: "legacy full bare", version: legacyInitialVersion, healthJSON: `{"status":"ok","version":"0.15.2","schema_version":1,"schema_compat_version":1}`},
+		{name: "legacy unknown field", version: legacyInitialVersion, healthJSON: `{"status":"ok","extra":true}`},
+		{name: "legacy malformed", version: legacyInitialVersion, healthJSON: `{"status":"ok"} trailing`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			paths := testHostPaths(t, root)
+			digest := "sha256:" + strings.Repeat("1", 64)
+			if test.version == legacyInitialVersion {
+				digest = "sha256:d57a0b7830f7248e29fe7c45c0848cb1167454709fd33effe07ff074415f571c"
+			}
+			if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+pinnedImageRef(test.version, digest)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runner := &fakeHostCommandRunner{imageRef: pinnedImageRef(test.version, digest), healthJSON: test.healthJSON}
+			runtime := newTestComposeRuntime(paths, runner)
+			if err := runtime.ObserveWatchdog(context.Background()); err == nil {
+				t.Fatal("minimal or malformed health escaped strict watchdog validation")
+			}
+		})
+	}
+}
+
+func TestComposeRuntimeAllowsMinimalHealthOnlyForExplicitLegacyRestore(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	paths := testHostPaths(t, root)
+	digest := "sha256:d57a0b7830f7248e29fe7c45c0848cb1167454709fd33effe07ff074415f571c"
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+pinnedImageRef(legacyInitialVersion, digest)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{imageRef: pinnedImageRef(legacyInitialVersion, digest), healthJSON: `{"status":"ok"}`}
+	runtime := newTestComposeRuntime(paths, runner)
+	recovery := BackupMetadata{Version: legacyInitialVersion, ImageDigest: digest, DatabaseSchema: 1, SchemaCompatVersion: 1, LegacyBootstrapAssumption: true}
+	if err := runtime.CheckRestored(context.Background(), recovery); err != nil {
+		t.Fatalf("explicit legacy restore rejected minimal health: %v", err)
+	}
+
+	formalDigest := "sha256:" + strings.Repeat("1", 64)
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+pinnedImageRef("v1.0.0", formalDigest)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.imageRef = pinnedImageRef("v1.0.0", formalDigest)
+	formal := BackupMetadata{Version: "v1.0.0", ImageDigest: formalDigest, DatabaseSchema: 1, SchemaCompatVersion: 1}
+	if err := runtime.CheckRestored(context.Background(), formal); err == nil {
+		t.Fatal("formal restore accepted minimal health")
+	}
+}
+
+func TestComposeRuntimeTargetHealthNeverUsesLegacyMinimalException(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{
+		imageRef:   "dirextalk/message-server:v1.1.0@sha256:" + strings.Repeat("a", 64),
+		healthJSON: `{"status":"ok"}`,
+	}
+	runtime := newTestComposeRuntime(paths, runner)
+	manifest, err := ValidateManifest([]byte(validManifestJSON()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.CheckTarget(context.Background(), manifest); err == nil {
+		t.Fatal("formal target accepted legacy minimal health exception")
+	}
+}
+
+func TestComposeRuntimeLegacyBootstrapRequiresExactPersistedSourceDigestBeforeStart(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	paths := testHostPaths(t, root)
+	observed := "sha256:d57a0b7830f7248e29fe7c45c0848cb1167454709fd33effe07ff074415f571c"
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+pinnedImageRef(legacyInitialVersion, observed)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{imageRef: pinnedImageRef(legacyInitialVersion, observed), healthJSON: `{"status":"ok"}`}
+	runtime := newTestComposeRuntime(paths, runner)
+	manifest, err := ValidateManifest([]byte(manifestJSONFor(firstFormalVersion, strings.Repeat("0", 64), ">=v0.15.2 <v1.0.0")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := testBackupPlan(manifest, legacyInitialVersion, "sha256:"+strings.Repeat("f", 64))
+	if _, err := runtime.PrepareBackup(context.Background(), Job{ID: "job_legacy_mismatch", CurrentVersion: legacyInitialVersion}, plan, ignoreProgress); err == nil {
+		t.Fatal("legacy source digest mismatch was accepted")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("legacy digest mismatch started Compose before rejection: %#v", runner.calls)
 	}
 }
 
