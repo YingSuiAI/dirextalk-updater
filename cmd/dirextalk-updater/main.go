@@ -60,10 +60,17 @@ func runServer(configPath string) error {
 	if err != nil {
 		return err
 	}
+	store := updater.NewStateStore(filepath.Join(config.StateDir, "runtime.json"))
+	runtime := updater.NewComposeRuntime()
+	if err := runtime.Recover(context.Background()); err != nil {
+		return fmt.Errorf("recover updater backup state: %w", err)
+	}
+	engine := updater.NewJobEngine(store, runtime)
 	service, err := updater.NewService(
-		updater.NewStateStore(filepath.Join(config.StateDir, "runtime.json")),
+		store,
 		controlToken,
 		updater.WithReleaseSource(updater.NewGitHubReleaseSource(&http.Client{Timeout: 30 * time.Second})),
+		updater.WithJobEngine(engine),
 	)
 	if err != nil {
 		return err
@@ -76,6 +83,7 @@ func runServer(configPath string) error {
 	server := &http.Server{Handler: service.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go service.RunJobs(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

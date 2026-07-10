@@ -53,6 +53,19 @@ go build -o dirextalk-updater ./cmd/dirextalk-updater
 处理，不能生成升级计划。`upgrading` 只允许由创建任务的内部事务设置；存在
 活动任务时，外部不能覆盖任何期望状态。
 
+任务在执行任何宿主机变更前都会先持久化检查点。updater 会短暂停止
+message-server，生成一致的 PostgreSQL custom dump、message 配置/数据归档和
+宿主机 `p2p` 归档；校验文件摘要、源版本、镜像摘要和 schema 元数据后，才会把
+staging 目录原子替换为 `backup/current`。始终只保留这一份已提交恢复点，损坏
+的 staging 备份不会覆盖它。
+
+目标服务只允许按 `vX.Y.Z@sha256:...` 拉取和重建。升级成功必须连续确认运行
+容器摘要、PostgreSQL、内部健康接口、schema 元数据以及同域 Caddy 健康接口
+完全一致；失败会自动回滚，updater 自身重启后会从已持久化步骤继续。连续三次
+恢复失败后任务进入 maintenance，只会通过带 job bearer 的
+`POST /_dirextalk/updater/v1/jobs/{job_id}/{operation}` 暴露已持久化的
+`rollback`/`restart` 操作，接口不接受任何基础设施参数。
+
 ## 发布资产
 
 稳定的 `vX.Y.Z` tag 会在 `ubuntu-24.04` 上使用固定 Go 1.24.13 执行验证，

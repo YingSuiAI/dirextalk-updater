@@ -244,7 +244,7 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 
 func hasActiveJob(state RuntimeState) bool {
 	for _, job := range state.Jobs {
-		if job.Status == JobQueued {
+		if job.Status.active() {
 			return true
 		}
 	}

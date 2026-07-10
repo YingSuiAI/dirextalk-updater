@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"reflect"
 	"strings"
@@ -34,6 +35,9 @@ type Service struct {
 	controlTokenHash string
 	now              func() time.Time
 	releaseSource    ReleaseSource
+	jobEngine        *JobEngine
+	jobSignal        chan struct{}
+	logf             func(string, ...any)
 }
 
 type ServiceOption func(*Service)
@@ -41,6 +45,18 @@ type ServiceOption func(*Service)
 func WithReleaseSource(source ReleaseSource) ServiceOption {
 	return func(service *Service) {
 		service.releaseSource = source
+	}
+}
+
+func WithJobEngine(engine *JobEngine) ServiceOption {
+	return func(service *Service) {
+		service.jobEngine = engine
+	}
+}
+
+func WithLogger(logf func(string, ...any)) ServiceOption {
+	return func(service *Service) {
+		service.logf = logf
 	}
 }
 
@@ -58,11 +74,48 @@ func NewService(store *StateStore, controlToken string, options ...ServiceOption
 		store:            store,
 		controlTokenHash: tokenHash(controlToken),
 		now:              time.Now,
+		jobSignal:        make(chan struct{}, 1),
+		logf:             log.Printf,
 	}
 	for _, option := range options {
 		option(service)
 	}
+	if service.jobEngine != nil && service.jobEngine.store != store {
+		return nil, fmt.Errorf("job engine must use the service state store")
+	}
+	if service.logf == nil {
+		return nil, fmt.Errorf("service logger is required")
+	}
 	return service, nil
+}
+
+func (service *Service) RunJobs(ctx context.Context) {
+	if service == nil || service.jobEngine == nil {
+		return
+	}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := service.jobEngine.RunActive(ctx); err != nil && ctx.Err() == nil {
+			service.logf("dirextalk updater job execution attempt failed: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-service.jobSignal:
+		case <-ticker.C:
+		}
+	}
+}
+
+func (service *Service) wakeJobRunner() {
+	if service.jobEngine == nil {
+		return
+	}
+	select {
+	case service.jobSignal <- struct{}{}:
+	default:
+	}
 }
 
 func (service *Service) Handler() http.Handler {
@@ -137,16 +190,7 @@ func (service *Service) serveHTTP(response http.ResponseWriter, request *http.Re
 		}
 		service.setDesiredState(response, request)
 	case strings.HasPrefix(request.URL.Path, publicJobsPrefix):
-		if request.Method != http.MethodGet {
-			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
-			return
-		}
-		jobID := strings.TrimPrefix(request.URL.Path, publicJobsPrefix)
-		if jobID == "" || strings.Contains(jobID, "/") {
-			writeAPIError(response, http.StatusNotFound, "job_not_found")
-			return
-		}
-		service.getJob(response, request, jobID)
+		service.servePublicJob(response, request)
 	default:
 		writeAPIError(response, http.StatusNotFound, "not_found")
 	}
@@ -188,12 +232,24 @@ type JobTicket struct {
 }
 
 type publicJob struct {
-	JobID          string    `json:"job_id"`
-	Status         JobStatus `json:"status"`
-	CurrentVersion string    `json:"current_version,omitempty"`
-	TargetVersion  string    `json:"target_version"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	JobID            string         `json:"job_id"`
+	Status           JobStatus      `json:"status"`
+	CurrentVersion   string         `json:"current_version,omitempty"`
+	TargetVersion    string         `json:"target_version"`
+	CurrentStep      JobStep        `json:"current_step,omitempty"`
+	CompletedSteps   int            `json:"completed_steps"`
+	TotalSteps       int            `json:"total_steps"`
+	ServiceAvailable bool           `json:"service_available"`
+	LastSafeVersion  string         `json:"last_safe_version,omitempty"`
+	ErrorCode        string         `json:"error_code,omitempty"`
+	ErrorMessage     string         `json:"error_message,omitempty"`
+	Operations       []JobOperation `json:"operations"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+}
+
+type JobOperation struct {
+	Kind string `json:"kind"`
 }
 
 func (service *Service) createJob(response http.ResponseWriter, request *http.Request) {
@@ -242,6 +298,11 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		if hasActiveJob(*state) {
 			return rejectMutation(http.StatusConflict, "operation_in_progress")
 		}
+		for _, existing := range state.Jobs {
+			if existing.PlanTokenHash == planHash {
+				return rejectMutation(http.StatusConflict, "plan_already_used")
+			}
+		}
 		if state.DesiredState != DesiredRunning {
 			return rejectMutation(http.StatusConflict, "desired_state_not_running")
 		}
@@ -264,6 +325,10 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 			IdempotencyKey:    input.IdempotencyKey,
 			CurrentVersion:    plan.CurrentVersion,
 			TargetVersion:     plan.Manifest.Version,
+			CurrentStep:       JobStepValidate,
+			TotalSteps:        executionTotalSteps,
+			ServiceAvailable:  true,
+			LastSafeVersion:   plan.CurrentVersion,
 			CreatedAt:         now,
 			UpdatedAt:         now,
 		}
@@ -281,6 +346,7 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		}
 		return
 	}
+	service.wakeJobRunner()
 	writeJSON(response, http.StatusAccepted, ticket)
 }
 
@@ -313,14 +379,114 @@ func (service *Service) getJob(response http.ResponseWriter, request *http.Reque
 		writeAPIError(response, http.StatusUnauthorized, "job_token_required")
 		return
 	}
-	writeJSON(response, http.StatusOK, publicJob{
-		JobID:          job.ID,
-		Status:         job.Status,
-		CurrentVersion: job.CurrentVersion,
-		TargetVersion:  job.TargetVersion,
-		CreatedAt:      job.CreatedAt,
-		UpdatedAt:      job.UpdatedAt,
+	writeJSON(response, http.StatusOK, publicJobView(job))
+}
+
+func publicJobView(job Job) publicJob {
+	return publicJob{
+		JobID:            job.ID,
+		Status:           job.Status,
+		CurrentVersion:   job.CurrentVersion,
+		TargetVersion:    job.TargetVersion,
+		CurrentStep:      job.CurrentStep,
+		CompletedSteps:   job.CompletedSteps,
+		TotalSteps:       job.TotalSteps,
+		ServiceAvailable: job.ServiceAvailable,
+		LastSafeVersion:  job.LastSafeVersion,
+		ErrorCode:        job.ErrorCode,
+		ErrorMessage:     job.ErrorMessage,
+		Operations:       publicJobOperations(job),
+		CreatedAt:        job.CreatedAt,
+		UpdatedAt:        job.UpdatedAt,
+	}
+}
+
+func publicJobOperations(job Job) []JobOperation {
+	operations := []JobOperation{}
+	if (job.Status == JobSucceeded || job.Status == JobFailed) && job.RecoveryPoint != nil {
+		operations = append(operations, JobOperation{Kind: "rollback"})
+	}
+	if job.Status == JobFailed && !job.ServiceAvailable {
+		operations = append(operations, JobOperation{Kind: "restart"})
+	}
+	return operations
+}
+
+func (service *Service) servePublicJob(response http.ResponseWriter, request *http.Request) {
+	remainder := strings.TrimPrefix(request.URL.Path, publicJobsPrefix)
+	parts := strings.Split(remainder, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		if request.Method != http.MethodGet {
+			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		service.getJob(response, request, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[0] != "" && (parts[1] == "rollback" || parts[1] == "restart") {
+		if request.Method != http.MethodPost {
+			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		service.startJobOperation(response, request, parts[0], parts[1])
+		return
+	}
+	writeAPIError(response, http.StatusNotFound, "job_not_found")
+}
+
+func (service *Service) startJobOperation(response http.ResponseWriter, request *http.Request, jobID, kind string) {
+	var input struct{}
+	if err := decodeControlRequest(response, request, &input, "job operation request"); err != nil {
+		writeAPIError(response, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	bearer := bearerToken(request.Header.Get("Authorization"))
+	var updated Job
+	var rejection *mutationRejection
+	err := service.store.Update(request.Context(), func(state *RuntimeState) error {
+		job, ok := state.Jobs[jobID]
+		if !ok {
+			return rejectMutation(http.StatusNotFound, "job_not_found")
+		}
+		if !jobTokenAllowed(job, bearer) {
+			return rejectMutation(http.StatusUnauthorized, "job_token_required")
+		}
+		allowed := false
+		for _, operation := range publicJobOperations(job) {
+			if operation.Kind == kind {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return rejectMutation(http.StatusConflict, "operation_not_available")
+		}
+		state.DesiredState = DesiredUpgrading
+		job.ServiceAvailable = false
+		job.RecoveryAttempts = 0
+		switch kind {
+		case "rollback":
+			job.Status = JobRollingBack
+			job.CurrentStep = JobStepRestoreBackup
+		case "restart":
+			job.Status = JobRestarting
+			job.CurrentStep = JobStepRestart
+		}
+		job.UpdatedAt = service.now().UTC()
+		state.Jobs[jobID] = job
+		updated = job
+		return nil
 	})
+	if err != nil {
+		if errors.As(err, &rejection) {
+			writeAPIError(response, rejection.status, rejection.code)
+		} else {
+			writeAPIError(response, http.StatusInternalServerError, "state_write_failed")
+		}
+		return
+	}
+	service.wakeJobRunner()
+	writeJSON(response, http.StatusAccepted, publicJobView(updated))
 }
 
 type mutationRejection struct {

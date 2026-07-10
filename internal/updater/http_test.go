@@ -106,6 +106,158 @@ func TestJobBearerIsHashedAndAuthorizesPublicStatus(t *testing.T) {
 	}
 }
 
+func TestPublicRestartOperationRequiresOfferedOperationAndJobBearer(t *testing.T) {
+	service, store := newTestService(t)
+	created := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"restart-request","confirm":"apply_release_change"}`, testControlToken, "")
+	var ticket JobTicket
+	decodeResponse(t, created, &ticket)
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		job := state.Jobs[ticket.JobID]
+		job.Status = JobFailed
+		job.CurrentStep = JobStepComplete
+		job.ServiceAvailable = false
+		job.ErrorCode = "backup_failed"
+		job.ErrorMessage = "safe failure"
+		state.Jobs[job.ID] = job
+		state.DesiredState = DesiredRunning
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := publicJobPath(ticket.JobID) + "/restart"
+	unauthorized := postJSON(t, service.Handler(), path, `{}`, "", "wrong-token")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized restart status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := postJSON(t, service.Handler(), path, `{}`, "", ticket.JobToken)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("restart status=%d body=%s", response.Code, response.Body.String())
+	}
+	var job publicJob
+	decodeResponse(t, response, &job)
+	if job.Status != JobRestarting || job.CurrentStep != JobStepRestart || job.ServiceAvailable {
+		t.Fatalf("restart was not durably queued: %#v", job)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.DesiredState != DesiredUpgrading {
+		t.Fatalf("restart did not enter protected desired state: %q", state.DesiredState)
+	}
+}
+
+func TestPublicRollbackOperationRequiresCommittedRecoveryMetadata(t *testing.T) {
+	service, store := newTestService(t)
+	created := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"rollback-request","confirm":"apply_release_change"}`, testControlToken, "")
+	var ticket JobTicket
+	decodeResponse(t, created, &ticket)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := state.Jobs[ticket.JobID]
+	recovery, err := (&fakeUpgradeRuntime{}).PrepareBackup(context.Background(), job, state.Plans[job.PlanTokenHash], ignoreProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		job := state.Jobs[ticket.JobID]
+		job.Status = JobFailed
+		job.CurrentStep = JobStepComplete
+		job.ServiceAvailable = false
+		job.ErrorCode = "rollback_required"
+		job.ErrorMessage = "safe failure"
+		job.RecoveryPoint = &recovery
+		state.Jobs[job.ID] = job
+		state.DesiredState = DesiredRunning
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response := postJSON(t, service.Handler(), publicJobPath(ticket.JobID)+"/rollback", `{}`, "", ticket.JobToken)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("rollback status=%d body=%s", response.Code, response.Body.String())
+	}
+	var public publicJob
+	decodeResponse(t, response, &public)
+	if public.Status != JobRollingBack || public.CurrentStep != JobStepRestoreBackup {
+		t.Fatalf("rollback was not durably queued: %#v", public)
+	}
+}
+
+func TestNewJobRevokesOlderTerminalRollbackAuthority(t *testing.T) {
+	service, store := newTestService(t)
+	firstResponse := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"first-edge","confirm":"apply_release_change"}`, testControlToken, "")
+	var first JobTicket
+	decodeResponse(t, firstResponse, &first)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstJob := state.Jobs[first.JobID]
+	recovery, err := (&fakeUpgradeRuntime{}).PrepareBackup(context.Background(), firstJob, state.Plans[firstJob.PlanTokenHash], ignoreProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		job := state.Jobs[first.JobID]
+		job.Status = JobSucceeded
+		job.CurrentStep = JobStepComplete
+		job.CompletedSteps = executionTotalSteps
+		job.ServiceAvailable = true
+		job.LastSafeVersion = job.TargetVersion
+		job.RecoveryPoint = &recovery
+		state.Jobs[job.ID] = job
+		state.DesiredState = DesiredRunning
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reused := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"reused-edge","confirm":"apply_release_change"}`, testControlToken, "")
+	if reused.Code != http.StatusConflict || !strings.Contains(reused.Body.String(), "plan_already_used") {
+		t.Fatalf("consumed plan was reused: status=%d body=%s", reused.Code, reused.Body.String())
+	}
+	nextManifest := *state.Discovery.Manifest
+	nextManifest.Version = "v1.2.0"
+	nextManifest.Image = AllowedImageRepository + ":v1.2.0"
+	nextManifest.UpgradeFrom = []string{"=v1.1.0"}
+	nextManifest.ReleaseNotesURL = "https://github.com/YingSuiAI/dirextalk-message-server/releases/tag/v1.2.0"
+	nextDigest := "sha256:" + strings.Repeat("e", 64)
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		state.Discovery.Manifest = &nextManifest
+		state.Discovery.ManifestDigest = nextDigest
+		state.Discovery.CheckedAt = time.Now().UTC()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RegisterPlan(context.Background(), "second-plan", Plan{Manifest: nextManifest, ManifestDigest: nextDigest, CurrentVersion: "v1.1.0", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	second := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"second-plan","idempotency_key":"second-edge","confirm":"apply_release_change"}`, testControlToken, "")
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("second job status=%d body=%s", second.Code, second.Body.String())
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Jobs[first.JobID].RecoveryPoint == nil {
+		t.Fatal("new job revoked the valid rollback before replacing the single backup slot")
+	}
+	if err := NewJobEngine(store, &fakeUpgradeRuntime{}).RunActive(context.Background()); err != nil {
+		t.Fatalf("run second version edge: %v", err)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Jobs[first.JobID].RecoveryPoint != nil || len(publicJobOperations(state.Jobs[first.JobID])) != 0 {
+		t.Fatalf("older job retained stale rollback authority: %#v", state.Jobs[first.JobID])
+	}
+}
+
 func TestIdempotentReplayReturnsSameJobAndSurvivesRestart(t *testing.T) {
 	service, store := newTestService(t)
 	firstResponse := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")

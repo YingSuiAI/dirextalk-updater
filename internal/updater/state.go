@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const RuntimeStateSchemaVersion = 2
+const RuntimeStateSchemaVersion = 3
 
 type DesiredState string
 
@@ -62,20 +62,41 @@ type Plan struct {
 type JobStatus string
 
 const (
-	JobQueued JobStatus = "queued"
+	JobQueued      JobStatus = "queued"
+	JobValidating  JobStatus = "validating"
+	JobBackingUp   JobStatus = "backing_up"
+	JobPulling     JobStatus = "pulling"
+	JobStopping    JobStatus = "stopping"
+	JobMigrating   JobStatus = "migrating"
+	JobStarting    JobStatus = "starting"
+	JobHealthCheck JobStatus = "health_check"
+	JobRollingBack JobStatus = "rolling_back"
+	JobRestarting  JobStatus = "restarting"
+	JobSucceeded   JobStatus = "succeeded"
+	JobFailed      JobStatus = "failed"
+	JobRolledBack  JobStatus = "rolled_back"
 )
 
 type Job struct {
-	ID                string    `json:"id"`
-	Status            JobStatus `json:"status"`
-	PlanTokenHash     string    `json:"plan_token_hash"`
-	ManifestDigest    string    `json:"manifest_digest"`
-	BearerTokenHashes []string  `json:"bearer_token_hashes"`
-	IdempotencyKey    string    `json:"idempotency_key"`
-	CurrentVersion    string    `json:"current_version,omitempty"`
-	TargetVersion     string    `json:"target_version"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                string          `json:"id"`
+	Status            JobStatus       `json:"status"`
+	PlanTokenHash     string          `json:"plan_token_hash"`
+	ManifestDigest    string          `json:"manifest_digest"`
+	BearerTokenHashes []string        `json:"bearer_token_hashes"`
+	IdempotencyKey    string          `json:"idempotency_key"`
+	CurrentVersion    string          `json:"current_version,omitempty"`
+	TargetVersion     string          `json:"target_version"`
+	CurrentStep       JobStep         `json:"current_step,omitempty"`
+	CompletedSteps    int             `json:"completed_steps,omitempty"`
+	TotalSteps        int             `json:"total_steps,omitempty"`
+	ServiceAvailable  bool            `json:"service_available"`
+	LastSafeVersion   string          `json:"last_safe_version,omitempty"`
+	ErrorCode         string          `json:"error_code,omitempty"`
+	ErrorMessage      string          `json:"error_message,omitempty"`
+	RecoveryPoint     *BackupMetadata `json:"recovery_point,omitempty"`
+	RecoveryAttempts  int             `json:"recovery_attempts,omitempty"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"`
 }
 
 type RuntimeState struct {
@@ -153,7 +174,7 @@ func (state *RuntimeState) normalizeAndValidate() error {
 		if job.ID == "" || job.ID != jobID {
 			return fmt.Errorf("job id is invalid")
 		}
-		if job.Status != JobQueued {
+		if !job.Status.valid() {
 			return fmt.Errorf("job %s status %q is invalid", jobID, job.Status)
 		}
 		if _, ok := state.Plans[job.PlanTokenHash]; !ok {
@@ -174,6 +195,9 @@ func (state *RuntimeState) normalizeAndValidate() error {
 				return fmt.Errorf("job %s bearer token hash is invalid", jobID)
 			}
 		}
+		if err := job.validateExecutionState(); err != nil {
+			return fmt.Errorf("job %s execution state is invalid: %w", jobID, err)
+		}
 	}
 	for idempotencyKey, jobID := range state.Idempotency {
 		job, ok := state.Jobs[jobID]
@@ -181,7 +205,11 @@ func (state *RuntimeState) normalizeAndValidate() error {
 			return fmt.Errorf("idempotency mapping is invalid")
 		}
 	}
-	activeJob := hasActiveJob(*state)
+	activeJobs := countActiveJobs(*state)
+	if activeJobs > 1 {
+		return fmt.Errorf("more than one active job is not allowed")
+	}
+	activeJob := activeJobs == 1
 	if state.DesiredState == DesiredUpgrading && !activeJob {
 		return fmt.Errorf("desired_state upgrading requires an active job")
 	}
@@ -263,6 +291,18 @@ func migrateRuntimeState(state *RuntimeState) error {
 		}
 		if hasActiveJob(*state) {
 			state.DesiredState = DesiredUpgrading
+		}
+		state.SchemaVersion = 2
+		fallthrough
+	case 2:
+		for jobID, job := range state.Jobs {
+			if job.Status == JobQueued {
+				job.CurrentStep = JobStepValidate
+				job.TotalSteps = executionTotalSteps
+				job.ServiceAvailable = true
+				job.LastSafeVersion = job.CurrentVersion
+				state.Jobs[jobID] = job
+			}
 		}
 		state.SchemaVersion = RuntimeStateSchemaVersion
 		return nil

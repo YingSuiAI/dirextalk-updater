@@ -151,10 +151,11 @@ func TestStateStoreMigratesSchemaOneQueuedJobCurrentVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load schema one state: %v", err)
 	}
-	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 2 {
+	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 3 {
 		t.Fatalf("state schema was not upgraded: %d", migrated.SchemaVersion)
 	}
-	if migrated.Jobs["job_1"].CurrentVersion != "v1.0.0" {
+	job := migrated.Jobs["job_1"]
+	if job.CurrentVersion != "v1.0.0" || job.CurrentStep != JobStepValidate || job.TotalSteps != executionTotalSteps {
 		t.Fatalf("queued job version edge was not restored: %#v", migrated.Jobs["job_1"])
 	}
 }

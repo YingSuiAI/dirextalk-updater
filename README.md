@@ -61,6 +61,22 @@ missing check timestamps are treated as stale and cannot issue a plan.
 The `upgrading` desired state is internal to the job transaction, and external
 desired-state changes are rejected while a job is active.
 
+An accepted job persists its checkpoint before host mutation. The updater
+stops message-server briefly to create a consistent PostgreSQL custom dump,
+message configuration/data archives, and host `p2p` archive. Checksums and
+source build/image/schema metadata are validated before the staging directory
+atomically replaces `backup/current`; only that one committed recovery point
+is retained. A corrupt staging backup never replaces it.
+
+The target is pulled and recreated only as `vX.Y.Z@sha256:...`. Success needs
+consecutive agreement between the running container image, PostgreSQL,
+internal health, schema metadata, and the same-domain Caddy health endpoint.
+Failure starts automatic rollback, and every restore checkpoint survives an
+updater restart. After three recovery failures the job enters maintenance and
+offers only the persisted `rollback`/`restart` operations through
+`POST /_dirextalk/updater/v1/jobs/{job_id}/{operation}` with the job bearer.
+No infrastructure parameters are accepted by these routes.
+
 ## Release assets
 
 A stable `vX.Y.Z` tag runs CI on `ubuntu-24.04` with Go 1.24.13, builds one
