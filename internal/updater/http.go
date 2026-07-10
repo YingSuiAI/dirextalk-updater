@@ -38,6 +38,7 @@ type Service struct {
 	jobEngine        *JobEngine
 	jobSignal        chan struct{}
 	logf             func(string, ...any)
+	hostGate         *HostOperationGate
 }
 
 type ServiceOption func(*Service)
@@ -60,6 +61,14 @@ func WithLogger(logf func(string, ...any)) ServiceOption {
 	}
 }
 
+func WithHostOperationGate(gate *HostOperationGate) ServiceOption {
+	return func(service *Service) {
+		if gate != nil {
+			service.hostGate = gate
+		}
+	}
+}
+
 func NewService(store *StateStore, controlToken string, options ...ServiceOption) (*Service, error) {
 	if store == nil {
 		return nil, fmt.Errorf("state store is required")
@@ -76,6 +85,7 @@ func NewService(store *StateStore, controlToken string, options ...ServiceOption
 		now:              time.Now,
 		jobSignal:        make(chan struct{}, 1),
 		logf:             log.Printf,
+		hostGate:         NewHostOperationGate(),
 	}
 	for _, option := range options {
 		option(service)
@@ -270,9 +280,31 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 	}
 
 	planHash := tokenHash(input.PlanToken)
+	snapshot, err := service.store.Load(request.Context())
+	if err != nil {
+		writeAPIError(response, http.StatusInternalServerError, "state_read_failed")
+		return
+	}
+	if existingID, exists := snapshot.Idempotency[input.IdempotencyKey]; exists {
+		service.replayJob(response, request, existingID, planHash)
+		return
+	}
+	if rejection := preflightNewJob(snapshot, planHash, service.now()); rejection != nil {
+		writeAPIError(response, rejection.status, rejection.code)
+		return
+	}
+	if request.Context().Err() != nil {
+		return
+	}
+	releaseHostGate := service.hostGate.BeginMutation()
+	defer releaseHostGate()
+	if request.Context().Err() != nil {
+		return
+	}
+
 	var ticket JobTicket
 	var rejection *mutationRejection
-	err := service.store.Update(request.Context(), func(state *RuntimeState) error {
+	err = service.store.Update(request.Context(), func(state *RuntimeState) error {
 		if existingID, exists := state.Idempotency[input.IdempotencyKey]; exists {
 			job, jobExists := state.Jobs[existingID]
 			if !jobExists {
@@ -335,6 +367,7 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		state.Jobs[job.ID] = job
 		state.Idempotency[input.IdempotencyKey] = job.ID
 		state.DesiredState = DesiredUpgrading
+		suppressWatchdog(state)
 		ticket = JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}
 		return nil
 	})
@@ -348,6 +381,57 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 	}
 	service.wakeJobRunner()
 	writeJSON(response, http.StatusAccepted, ticket)
+}
+
+func (service *Service) replayJob(response http.ResponseWriter, request *http.Request, existingID, planHash string) {
+	var ticket JobTicket
+	var rejection *mutationRejection
+	err := service.store.Update(request.Context(), func(state *RuntimeState) error {
+		job, exists := state.Jobs[existingID]
+		if !exists {
+			return rejectMutation(http.StatusInternalServerError, "state_inconsistent")
+		}
+		if job.PlanTokenHash != planHash {
+			return rejectMutation(http.StatusConflict, "idempotency_conflict")
+		}
+		rawBearer, tokenErr := randomToken(32)
+		if tokenErr != nil {
+			return rejectMutation(http.StatusInternalServerError, "token_generation_failed")
+		}
+		job.BearerTokenHashes = append(job.BearerTokenHashes, tokenHash(rawBearer))
+		job.UpdatedAt = service.now().UTC()
+		state.Jobs[job.ID] = job
+		ticket = JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}
+		return nil
+	})
+	if err != nil {
+		if errors.As(err, &rejection) {
+			writeAPIError(response, rejection.status, rejection.code)
+		} else {
+			writeAPIError(response, http.StatusInternalServerError, "state_write_failed")
+		}
+		return
+	}
+	writeJSON(response, http.StatusAccepted, ticket)
+}
+
+func preflightNewJob(state RuntimeState, planHash string, now time.Time) *mutationRejection {
+	plan, ok := state.Plans[planHash]
+	if !ok || !plan.ExpiresAt.After(now) {
+		return &mutationRejection{status: http.StatusConflict, code: "plan_invalid_or_expired"}
+	}
+	if hasActiveJob(state) {
+		return &mutationRejection{status: http.StatusConflict, code: "operation_in_progress"}
+	}
+	for _, existing := range state.Jobs {
+		if existing.PlanTokenHash == planHash {
+			return &mutationRejection{status: http.StatusConflict, code: "plan_already_used"}
+		}
+	}
+	if state.DesiredState != DesiredRunning {
+		return &mutationRejection{status: http.StatusConflict, code: "desired_state_not_running"}
+	}
+	return nil
 }
 
 func (service *Service) controlAuthorized(request *http.Request) bool {
@@ -441,9 +525,36 @@ func (service *Service) startJobOperation(response http.ResponseWriter, request 
 		return
 	}
 	bearer := bearerToken(request.Header.Get("Authorization"))
+	snapshot, err := service.store.Load(request.Context())
+	if err != nil {
+		writeAPIError(response, http.StatusInternalServerError, "state_read_failed")
+		return
+	}
+	snapshotJob, ok := snapshot.Jobs[jobID]
+	if !ok {
+		writeAPIError(response, http.StatusNotFound, "job_not_found")
+		return
+	}
+	if !jobTokenAllowed(snapshotJob, bearer) {
+		writeAPIError(response, http.StatusUnauthorized, "job_token_required")
+		return
+	}
+	operationAllowed := false
+	for _, operation := range publicJobOperations(snapshotJob) {
+		if operation.Kind == kind {
+			operationAllowed = true
+			break
+		}
+	}
+	if !operationAllowed {
+		writeAPIError(response, http.StatusConflict, "operation_not_available")
+		return
+	}
+	releaseHostGate := service.hostGate.BeginMutation()
+	defer releaseHostGate()
 	var updated Job
 	var rejection *mutationRejection
-	err := service.store.Update(request.Context(), func(state *RuntimeState) error {
+	err = service.store.Update(request.Context(), func(state *RuntimeState) error {
 		job, ok := state.Jobs[jobID]
 		if !ok {
 			return rejectMutation(http.StatusNotFound, "job_not_found")
@@ -462,6 +573,7 @@ func (service *Service) startJobOperation(response http.ResponseWriter, request 
 			return rejectMutation(http.StatusConflict, "operation_not_available")
 		}
 		state.DesiredState = DesiredUpgrading
+		suppressWatchdog(state)
 		job.ServiceAvailable = false
 		job.RecoveryAttempts = 0
 		switch kind {

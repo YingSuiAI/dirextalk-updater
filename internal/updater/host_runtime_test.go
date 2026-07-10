@@ -273,12 +273,92 @@ func TestComposeRuntimeDoesNotFsyncDiscardedStagingAfterCommit(t *testing.T) {
 	}
 }
 
+func TestComposeRuntimeWatchdogRepairUsesPinnedLocalImageAndFixedOrder(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{}
+	runtime := newTestComposeRuntime(paths, runner)
+
+	if err := runtime.RepairWatchdog(context.Background()); err != nil {
+		t.Fatalf("repair watchdog: %v", err)
+	}
+	assertCallSequence(t, runner.calls, []string{
+		"systemctl start docker.service",
+		"docker image inspect",
+		" up -d --no-deps --pull never postgres",
+		" pg_isready ",
+		" up -d --no-deps --pull never message-server",
+		" up -d --no-deps --pull never caddy",
+		"{{.State.Status}}",
+		"CREATE TEMP TABLE dirextalk_updater_probe",
+	})
+	joined := strings.Join(runner.calls, "\n")
+	for _, forbidden := range []string{"docker pull", ":latest", "pg_dump", "pg_restore", "backup", "migration", "release"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("watchdog repair used forbidden operation %q: %s", forbidden, joined)
+		}
+	}
+}
+
+func TestComposeRuntimeWatchdogFailsClosedWhenPinnedImageIsNotLocal(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{failContains: "image inspect"}
+	runtime := newTestComposeRuntime(paths, runner)
+
+	if err := runtime.RepairWatchdog(context.Background()); err == nil {
+		t.Fatal("watchdog pulled or started services without the pinned local image")
+	}
+	joined := strings.Join(runner.calls, "\n")
+	if strings.Contains(joined, "docker pull") || strings.Contains(joined, " up -d --no-deps --pull never postgres") {
+		t.Fatalf("watchdog mutated Compose after local image failure: %s", joined)
+	}
+}
+
+func TestComposeRuntimeWatchdogObservesDockerAndCurrentPinnedHealth(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{}
+	runtime := newTestComposeRuntime(paths, runner)
+
+	if err := runtime.ObserveWatchdog(context.Background()); err != nil {
+		t.Fatalf("observe watchdog: %v", err)
+	}
+	assertCallSequence(t, runner.calls, []string{
+		"systemctl is-active --quiet docker.service",
+		"{{.State.Status}}",
+		"CREATE TEMP TABLE dirextalk_updater_probe",
+	})
+}
+
+func TestComposeRuntimeStreamsOnlyFixedProjectFailureEvents(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{eventOutput: "container-one\ncontainer-two\n"}
+	runtime := newTestComposeRuntime(paths, runner)
+	events := 0
+
+	if err := runtime.StreamWatchdogEvents(context.Background(), func() { events++ }); err != nil {
+		t.Fatalf("stream watchdog events: %v", err)
+	}
+	if events != 2 {
+		t.Fatalf("event notifications = %d, want 2", events)
+	}
+	joined := strings.Join(runner.calls, "\n")
+	for _, required := range []string{"docker events", "label=com.docker.compose.project=dirextalk-p2p", "event=die", "event=stop", "event=kill"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("event stream omitted %q: %s", required, joined)
+		}
+	}
+}
+
 type fakeHostCommandRunner struct {
 	calls          []string
 	imageRef       string
 	healthJSON     string
 	failContains   string
 	serviceStopped bool
+	eventOutput    string
 }
 
 func (runner *fakeHostCommandRunner) Run(_ context.Context, stdin io.Reader, stdout io.Writer, name string, args ...string) error {
@@ -297,6 +377,8 @@ func (runner *fakeHostCommandRunner) Run(_ context.Context, stdin io.Reader, std
 		return fmt.Errorf("message-server is stopped")
 	}
 	switch {
+	case name == "docker" && len(args) > 0 && args[0] == "events":
+		_, _ = io.WriteString(stdout, runner.eventOutput)
 	case strings.Contains(joined, "{{.State.Status}}"):
 		_, _ = io.WriteString(stdout, "running healthy\n")
 	case strings.Contains(joined, "{{.Config.Image}}"):

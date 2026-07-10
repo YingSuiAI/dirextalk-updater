@@ -77,6 +77,15 @@ offers only the persisted `rollback`/`restart` operations through
 `POST /_dirextalk/updater/v1/jobs/{job_id}/{operation}` with the job bearer.
 No infrastructure parameters are accepted by these routes.
 
+The resident process also monitors the fixed Compose project through Docker
+failure events and a 30-second reconciliation loop. Recovery is allowed only
+while the persisted desired state is `running`, requires three failed
+observations, uses at most three repair attempts in ten minutes, and enters a
+15-minute degraded cooldown when that budget is exhausted. Repair starts only
+Docker, PostgreSQL, message-server, and Caddy in that order using the already
+configured local tag-and-digest image. It never resolves a Release, pulls
+`latest`, rotates a backup, or runs a migration.
+
 ## Release assets
 
 A stable `vX.Y.Z` tag runs CI on `ubuntu-24.04` with Go 1.24.13, builds one

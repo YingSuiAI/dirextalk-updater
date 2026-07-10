@@ -151,8 +151,11 @@ func TestStateStoreMigratesSchemaOneQueuedJobCurrentVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load schema one state: %v", err)
 	}
-	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 3 {
+	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 4 {
 		t.Fatalf("state schema was not upgraded: %d", migrated.SchemaVersion)
+	}
+	if migrated.Watchdog.Status != WatchdogUnknown {
+		t.Fatalf("watchdog state was not initialized during migration: %#v", migrated.Watchdog)
 	}
 	job := migrated.Jobs["job_1"]
 	if job.CurrentVersion != "v1.0.0" || job.CurrentStep != JobStepValidate || job.TotalSteps != executionTotalSteps {

@@ -52,6 +52,15 @@ type StatusResponse struct {
 	Reasons          []string            `json:"reasons"`
 	ReleaseNotesURL  string              `json:"release_notes_url"`
 	Operations       []StatusOperation   `json:"operations"`
+	Watchdog         WatchdogStatusView  `json:"watchdog"`
+}
+
+type WatchdogStatusView struct {
+	Status         WatchdogStatus `json:"status"`
+	Degraded       bool           `json:"degraded"`
+	CooldownUntil  *time.Time     `json:"cooldown_until"`
+	LastObservedAt *time.Time     `json:"last_observed_at"`
+	ErrorCode      string         `json:"error_code"`
 }
 
 func (service *Service) getStatus(response http.ResponseWriter, request *http.Request) {
@@ -160,6 +169,7 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 		Compatibility:   CompatibilityUnknown,
 		Reasons:         []string{},
 		Operations:      []StatusOperation{},
+		Watchdog:        publicWatchdogStatus(state.Watchdog),
 	}
 	if !state.Discovery.CheckedAt.IsZero() {
 		checkedAt := state.Discovery.CheckedAt.UTC()
@@ -240,6 +250,23 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 		CurrentVersion: input.CurrentVersion,
 		ExpiresAt:      now.Add(statusPlanLifetime),
 	}
+}
+
+func publicWatchdogStatus(state WatchdogState) WatchdogStatusView {
+	view := WatchdogStatusView{
+		Status:    state.Status,
+		Degraded:  state.Status == WatchdogDegraded,
+		ErrorCode: state.ErrorCode,
+	}
+	if !state.CooldownUntil.IsZero() {
+		cooldown := state.CooldownUntil.UTC()
+		view.CooldownUntil = &cooldown
+	}
+	if !state.LastObservedAt.IsZero() {
+		observed := state.LastObservedAt.UTC()
+		view.LastObservedAt = &observed
+	}
+	return view
 }
 
 func hasActiveJob(state RuntimeState) bool {

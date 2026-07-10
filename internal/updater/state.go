@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const RuntimeStateSchemaVersion = 3
+const RuntimeStateSchemaVersion = 4
 
 type DesiredState string
 
@@ -99,10 +99,41 @@ type Job struct {
 	UpdatedAt         time.Time       `json:"updated_at"`
 }
 
+type WatchdogStatus string
+
+const (
+	WatchdogUnknown    WatchdogStatus = "unknown"
+	WatchdogHealthy    WatchdogStatus = "healthy"
+	WatchdogObserving  WatchdogStatus = "observing"
+	WatchdogRepairing  WatchdogStatus = "repairing"
+	WatchdogDegraded   WatchdogStatus = "degraded"
+	WatchdogSuppressed WatchdogStatus = "suppressed"
+)
+
+func (status WatchdogStatus) valid() bool {
+	switch status {
+	case WatchdogUnknown, WatchdogHealthy, WatchdogObserving, WatchdogRepairing, WatchdogDegraded, WatchdogSuppressed:
+		return true
+	default:
+		return false
+	}
+}
+
+type WatchdogState struct {
+	Status              WatchdogStatus `json:"status"`
+	ConsecutiveFailures int            `json:"consecutive_failures,omitempty"`
+	Attempts            []time.Time    `json:"attempts,omitempty"`
+	CooldownUntil       time.Time      `json:"cooldown_until,omitempty"`
+	LastObservedAt      time.Time      `json:"last_observed_at,omitempty"`
+	LastRepairAt        time.Time      `json:"last_repair_at,omitempty"`
+	ErrorCode           string         `json:"error_code,omitempty"`
+}
+
 type RuntimeState struct {
 	SchemaVersion int               `json:"schema_version"`
 	DesiredState  DesiredState      `json:"desired_state"`
 	Discovery     DiscoveryCache    `json:"discovery"`
+	Watchdog      WatchdogState     `json:"watchdog"`
 	Plans         map[string]Plan   `json:"plans,omitempty"`
 	Jobs          map[string]Job    `json:"jobs,omitempty"`
 	Idempotency   map[string]string `json:"idempotency,omitempty"`
@@ -113,6 +144,7 @@ func NewRuntimeState() RuntimeState {
 		SchemaVersion: RuntimeStateSchemaVersion,
 		DesiredState:  DesiredRunning,
 		Discovery:     DiscoveryCache{Status: DiscoveryUnknown},
+		Watchdog:      WatchdogState{Status: WatchdogUnknown},
 		Plans:         map[string]Plan{},
 		Jobs:          map[string]Job{},
 		Idempotency:   map[string]string{},
@@ -125,6 +157,28 @@ func (state *RuntimeState) normalizeAndValidate() error {
 	}
 	if !state.DesiredState.valid() {
 		return fmt.Errorf("desired_state %q is invalid", state.DesiredState)
+	}
+	if !state.Watchdog.Status.valid() {
+		return fmt.Errorf("watchdog status %q is invalid", state.Watchdog.Status)
+	}
+	if state.Watchdog.ConsecutiveFailures < 0 || state.Watchdog.ConsecutiveFailures > watchdogObservationThreshold {
+		return fmt.Errorf("watchdog consecutive_failures is invalid")
+	}
+	if len(state.Watchdog.Attempts) > watchdogMaxAttempts {
+		return fmt.Errorf("watchdog attempts exceed the fixed budget")
+	}
+	for index, attempt := range state.Watchdog.Attempts {
+		if attempt.IsZero() || (index > 0 && attempt.Before(state.Watchdog.Attempts[index-1])) {
+			return fmt.Errorf("watchdog attempts are invalid")
+		}
+	}
+	switch state.Watchdog.ErrorCode {
+	case "", "observation_failed", "repair_failed":
+	default:
+		return fmt.Errorf("watchdog error_code is invalid")
+	}
+	if state.Watchdog.Status == WatchdogDegraded && state.Watchdog.CooldownUntil.IsZero() {
+		return fmt.Errorf("degraded watchdog requires cooldown_until")
 	}
 	if state.Plans == nil {
 		state.Plans = map[string]Plan{}
@@ -304,6 +358,10 @@ func migrateRuntimeState(state *RuntimeState) error {
 				state.Jobs[jobID] = job
 			}
 		}
+		state.SchemaVersion = 3
+		fallthrough
+	case 3:
+		state.Watchdog = WatchdogState{Status: WatchdogUnknown}
 		state.SchemaVersion = RuntimeStateSchemaVersion
 		return nil
 	default:

@@ -27,6 +27,8 @@ func (service *Service) setDesiredState(response http.ResponseWriter, request *h
 		writeAPIError(response, http.StatusBadRequest, "invalid_request")
 		return
 	}
+	releaseHostGate := service.hostGate.BeginMutation()
+	defer releaseHostGate()
 	var rejection *mutationRejection
 	if err := service.store.Update(request.Context(), func(state *RuntimeState) error {
 		if hasActiveJob(*state) {
@@ -36,6 +38,7 @@ func (service *Service) setDesiredState(response http.ResponseWriter, request *h
 			return rejectMutation(http.StatusConflict, "desired_state_reserved")
 		}
 		state.DesiredState = input.DesiredState
+		suppressWatchdog(state)
 		return nil
 	}); err != nil {
 		if errors.As(err, &rejection) {

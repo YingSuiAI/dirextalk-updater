@@ -91,7 +91,7 @@ func TestControlStatusUsesOnlyCachedDiscoveryAndCreatesRestartSafePlan(t *testin
 	if err := json.Unmarshal([]byte(rawResponse), &fields); err != nil {
 		t.Fatal(err)
 	}
-	expectedFields := []string{"available", "release_available", "update_available", "discovery_status", "checked_at", "current_version", "latest_version", "client_version", "compatibility", "reasons", "release_notes_url", "operations"}
+	expectedFields := []string{"available", "release_available", "update_available", "discovery_status", "checked_at", "current_version", "latest_version", "client_version", "compatibility", "reasons", "release_notes_url", "operations", "watchdog"}
 	if len(fields) != len(expectedFields) {
 		t.Fatalf("unexpected status response fields: %v", fields)
 	}
@@ -99,6 +99,28 @@ func TestControlStatusUsesOnlyCachedDiscoveryAndCreatesRestartSafePlan(t *testin
 		if _, ok := fields[field]; !ok {
 			t.Fatalf("missing status response field %q: %s", field, rawResponse)
 		}
+	}
+}
+
+func TestStatusExposesPersistedWatchdogDegradationWithoutRepairInternals(t *testing.T) {
+	t.Parallel()
+	state := NewRuntimeState()
+	cooldown := time.Date(2026, 7, 10, 12, 15, 0, 0, time.UTC)
+	observed := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	state.Watchdog = WatchdogState{
+		Status:         WatchdogDegraded,
+		CooldownUntil:  cooldown,
+		LastObservedAt: observed,
+		ErrorCode:      "repair_failed",
+	}
+	status, _ := evaluateStatus(state, normalizedStatusRequest{
+		CurrentVersion:             "v1.0.0",
+		CurrentSchemaVersion:       1,
+		CurrentSchemaCompatVersion: 1,
+		ClientVersion:              "v1.0.0",
+	}, observed)
+	if status.Watchdog.Status != WatchdogDegraded || !status.Watchdog.Degraded || status.Watchdog.CooldownUntil == nil || !status.Watchdog.CooldownUntil.Equal(cooldown) || status.Watchdog.ErrorCode != "repair_failed" {
+		t.Fatalf("watchdog status was not exposed safely: %#v", status.Watchdog)
 	}
 }
 

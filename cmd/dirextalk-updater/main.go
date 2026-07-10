@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -66,11 +67,15 @@ func runServer(configPath string) error {
 		return fmt.Errorf("recover updater backup state: %w", err)
 	}
 	engine := updater.NewJobEngine(store, runtime)
+	hostGate := updater.NewHostOperationGate()
+	watchdog := updater.NewWatchdog(store, runtime, hostGate)
+	watchdog.SetLogger(log.Printf)
 	service, err := updater.NewService(
 		store,
 		controlToken,
 		updater.WithReleaseSource(updater.NewGitHubReleaseSource(&http.Client{Timeout: 30 * time.Second})),
 		updater.WithJobEngine(engine),
+		updater.WithHostOperationGate(hostGate),
 	)
 	if err != nil {
 		return err
@@ -84,6 +89,7 @@ func runServer(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go service.RunJobs(ctx)
+	go watchdog.Run(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -376,6 +376,135 @@ func (runtime *ComposeRuntime) RestartCurrent(ctx context.Context, job Job) erro
 	return fmt.Errorf("current service did not pass the confirmation window: %w", lastErr)
 }
 
+// ObserveWatchdog verifies the already configured release without resolving or
+// mutating any release input. Repeated failed observations are budgeted by
+// Watchdog before RepairWatchdog is allowed to touch the host.
+func (runtime *ComposeRuntime) ObserveWatchdog(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+	defer cancel()
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "systemctl", "is-active", "--quiet", "docker.service"); err != nil {
+		return fmt.Errorf("Docker service is unavailable")
+	}
+	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
+	if err != nil {
+		return err
+	}
+	version, digest, err := parsePinnedImageRef(imageRef)
+	if err != nil {
+		return fmt.Errorf("configured message-server image is not pinned")
+	}
+	if err := runtime.checkCurrentOnce(ctx, version, digest); err != nil {
+		return fmt.Errorf("configured message-server release is unhealthy")
+	}
+	return nil
+}
+
+// RepairWatchdog starts only the fixed, currently pinned host topology. It
+// never pulls an image, resolves a release, rotates backup state, or runs an
+// upgrade/migration command.
+func (runtime *ComposeRuntime) RepairWatchdog(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+	defer cancel()
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "systemctl", "start", "docker.service"); err != nil {
+		return fmt.Errorf("start Docker service: %w", err)
+	}
+	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
+	if err != nil {
+		return err
+	}
+	version, digest, err := parsePinnedImageRef(imageRef)
+	if err != nil {
+		return fmt.Errorf("configured message-server image is not pinned")
+	}
+	local, err := runtime.localPinnedImageAvailable(ctx, imageRef, digest)
+	if err != nil || !local {
+		return fmt.Errorf("configured pinned message-server image is not available locally")
+	}
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--pull", "never", "postgres")...); err != nil {
+		return fmt.Errorf("start watchdog PostgreSQL: %w", err)
+	}
+	if err := runtime.waitWatchdogPostgres(ctx); err != nil {
+		return err
+	}
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--pull", "never", "message-server")...); err != nil {
+		return fmt.Errorf("start watchdog message-server: %w", err)
+	}
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--pull", "never", "caddy")...); err != nil {
+		return fmt.Errorf("start watchdog Caddy: %w", err)
+	}
+	consecutive := 0
+	var lastErr error
+	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
+		lastErr = runtime.checkCurrentOnce(ctx, version, digest)
+		if lastErr == nil {
+			consecutive++
+			if consecutive >= runtime.paths.healthConsecutive {
+				return nil
+			}
+		} else {
+			consecutive = 0
+		}
+		if attempt+1 < runtime.paths.healthAttempts {
+			if err := runtime.paths.sleep(ctx, runtime.paths.healthInterval); err != nil {
+				return err
+			}
+		}
+	}
+	return fmt.Errorf("watchdog repair did not restore the pinned release: %w", lastErr)
+}
+
+func (runtime *ComposeRuntime) waitWatchdogPostgres(ctx context.Context) error {
+	var lastErr error
+	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
+		lastErr = runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("exec", "-T", "postgres", "pg_isready", "-U", "dirextalk_message_server", "-d", "dirextalk_message_server")...)
+		if lastErr == nil {
+			return nil
+		}
+		if attempt+1 < runtime.paths.healthAttempts {
+			if err := runtime.paths.sleep(ctx, runtime.paths.healthInterval); err != nil {
+				return err
+			}
+		}
+	}
+	return fmt.Errorf("watchdog PostgreSQL is not ready: %w", lastErr)
+}
+
+func (runtime *ComposeRuntime) StreamWatchdogEvents(ctx context.Context, notify func()) error {
+	if notify == nil {
+		return fmt.Errorf("watchdog event callback is required")
+	}
+	writer := &watchdogEventWriter{notify: notify}
+	return runtime.runner.Run(ctx, nil, writer, "docker", "events",
+		"--filter", "label=com.docker.compose.project="+AllowedComposeProject,
+		"--filter", "event=die",
+		"--filter", "event=stop",
+		"--filter", "event=kill",
+		"--format", "{{.ID}}",
+	)
+}
+
+type watchdogEventWriter struct {
+	pending []byte
+	notify  func()
+}
+
+func (writer *watchdogEventWriter) Write(data []byte) (int, error) {
+	original := len(data)
+	writer.pending = append(writer.pending, data...)
+	for {
+		newline := bytes.IndexByte(writer.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		line := bytes.TrimSpace(writer.pending[:newline])
+		writer.pending = writer.pending[newline+1:]
+		if len(line) > 0 {
+			writer.notify()
+		}
+	}
+	return original, nil
+}
+
 func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVersion string) (string, string, runtimeHealth, error) {
 	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
 	if err != nil {

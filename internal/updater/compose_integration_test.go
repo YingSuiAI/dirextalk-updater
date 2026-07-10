@@ -166,6 +166,42 @@ func TestUbuntuComposeBackupUpgradeAndRollback(t *testing.T) {
 	if err := runtime.CheckRestored(ctx, *job.RecoveryPoint); err != nil {
 		t.Fatalf("restarted source release did not pass health confirmation: %v", err)
 	}
+
+	if err := realRunner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("stop", "message-server")...); err != nil {
+		t.Fatalf("stop fixture before watchdog suppression checks: %v", err)
+	}
+	for _, desired := range []DesiredState{DesiredMaintenance, DesiredDeprovisioned, DesiredUpgrading} {
+		var watchdogStore *StateStore
+		if desired == DesiredUpgrading {
+			watchdogStore, _ = seedQueuedExecutionJob(t)
+		} else {
+			watchdogStore = NewStateStore(filepath.Join(t.TempDir(), "runtime.json"))
+			watchdogState := NewRuntimeState()
+			watchdogState.DesiredState = desired
+			if err := watchdogStore.Save(ctx, watchdogState); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := NewWatchdog(watchdogStore, runtime).Reconcile(ctx); err != nil {
+			t.Fatalf("watchdog suppression for %s: %v", desired, err)
+		}
+		assertFixtureMessageServerStopped(t, ctx, realRunner)
+	}
+	watchdogStore := NewStateStore(filepath.Join(t.TempDir(), "runtime.json"))
+	watchdog := NewWatchdog(watchdogStore, runtime)
+	for observation := 0; observation < watchdogObservationThreshold; observation++ {
+		_ = watchdog.Reconcile(ctx)
+	}
+	watchdogState, err := watchdogStore.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watchdogState.Watchdog.Status != WatchdogHealthy {
+		t.Fatalf("real Compose watchdog did not repair the stopped service: %#v", watchdogState.Watchdog)
+	}
+	if err := runtime.ObserveWatchdog(ctx); err != nil {
+		t.Fatalf("watchdog-repaired fixture is unhealthy: %v", err)
+	}
 }
 
 type integrationCommandRunner struct {
@@ -178,6 +214,9 @@ type integrationCommandRunner struct {
 func (runner *integrationCommandRunner) Run(ctx context.Context, stdin io.Reader, stdout io.Writer, name string, args ...string) error {
 	joined := strings.Join(args, " ")
 	targetActivation := false
+	if name == "systemctl" {
+		return nil
+	}
 	if name == "docker" && strings.Contains(joined, "inspect --format {{.Config.Image}} ") {
 		ref, err := readEnvironmentValue(runner.envFile, "MESSAGE_SERVER_IMAGE")
 		if err != nil {
@@ -270,12 +309,25 @@ func writeComposeFixture(t *testing.T, root, image string) {
       - message-data:/var/dirextalk-message-server
       - ./p2p:/var/dirextalk-message-server/p2p
       - ./health.json:/www/_p2p/health:ro
+  caddy:
+    image: ${FIXTURE_IMAGE}
 volumes:
   postgres-data:
   message-config:
   message-data:
 `
 	write("docker-compose.yml", compose, 0o600)
+}
+
+func assertFixtureMessageServerStopped(t *testing.T, ctx context.Context, runner hostCommandRunner) {
+	t.Helper()
+	var status bytes.Buffer
+	if err := runner.Run(ctx, nil, &status, "docker", "inspect", "--format", "{{.State.Status}}", composeContainerName("message-server")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(status.String()) != "exited" {
+		t.Fatalf("intentionally stopped message-server was resurrected: %q", status.String())
+	}
 }
 
 func seedFixtureState(t *testing.T, ctx context.Context, runtime *ComposeRuntime) {
