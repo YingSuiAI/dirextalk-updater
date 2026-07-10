@@ -85,7 +85,7 @@ func TestUbuntuComposeBackupUpgradeAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := Job{ID: "job_integration", CurrentVersion: "v1.0.0"}
-	recovery, err := runtime.PrepareBackup(ctx, job, Plan{Manifest: manifest, CurrentVersion: job.CurrentVersion}, ignoreProgress)
+	recovery, err := runtime.PrepareBackup(ctx, job, testBackupPlan(manifest, job.CurrentVersion, "sha256:"+strings.Repeat("1", 64)), ignoreProgress)
 	if err != nil {
 		t.Fatalf("real Compose backup: %v", err)
 	}

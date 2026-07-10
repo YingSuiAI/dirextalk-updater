@@ -43,7 +43,7 @@ func TestControlDiscoveryRequiresTokenAndUsesTheResidentStateOwner(t *testing.T)
 	calls := 0
 	service, err := NewService(store, testControlToken, WithReleaseSource(releaseSourceFunc(func(context.Context) ([]byte, error) {
 		calls++
-		return []byte(validManifestJSON()), nil
+		return []byte(validSingleReleaseIndexJSON(t)), nil
 	})))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
@@ -96,6 +96,9 @@ func TestJobBearerIsHashedAndAuthorizesPublicStatus(t *testing.T) {
 	decodeResponse(t, status, &publicStatus)
 	if publicStatus.CurrentVersion != "v1.0.0" || publicStatus.TargetVersion != "v1.1.0" {
 		t.Fatalf("job status lost its immutable version edge: %#v", publicStatus)
+	}
+	if publicStatus.CompletedHops != 0 || publicStatus.TotalHops != 1 || publicStatus.TotalSteps != executionTotalSteps {
+		t.Fatalf("job status lost overall release progress: %#v", publicStatus)
 	}
 	request = httptest.NewRequest(http.MethodGet, publicJobPath(ticket.JobID), nil)
 	request.Header.Set("Authorization", "Bearer wrong")
@@ -205,6 +208,8 @@ func TestNewJobRevokesOlderTerminalRollbackAuthority(t *testing.T) {
 		job.Status = JobSucceeded
 		job.CurrentStep = JobStepComplete
 		job.CompletedSteps = executionTotalSteps
+		job.CurrentHop = job.TotalHops
+		job.CurrentVersion = job.TargetVersion
 		job.ServiceAvailable = true
 		job.LastSafeVersion = job.TargetVersion
 		job.RecoveryPoint = &recovery
@@ -223,10 +228,16 @@ func TestNewJobRevokesOlderTerminalRollbackAuthority(t *testing.T) {
 	nextManifest.Image = AllowedImageRepository + ":v1.2.0"
 	nextManifest.UpgradeFrom = []string{"=v1.1.0"}
 	nextManifest.ReleaseNotesURL = "https://github.com/YingSuiAI/dirextalk-message-server/releases/tag/v1.2.0"
-	nextDigest := "sha256:" + strings.Repeat("e", 64)
+	nextDigest := canonicalManifestDigest(nextManifest)
 	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		index := *state.Discovery.Index
+		index.LatestVersion = nextManifest.Version
+		index.Releases = append(append([]IndexedRelease(nil), index.Releases...), IndexedRelease{Manifest: nextManifest, ManifestDigest: nextDigest})
+		index.Edges = append(append([]UpgradeEdge(nil), index.Edges...), UpgradeEdge{FromVersion: "v1.1.0", FromImageDigests: []string{"sha256:" + strings.Repeat("a", 64)}, ToVersion: nextManifest.Version})
 		state.Discovery.Manifest = &nextManifest
 		state.Discovery.ManifestDigest = nextDigest
+		state.Discovery.Index = &index
+		state.Discovery.IndexDigest = canonicalReleaseIndexDigest(index)
 		state.Discovery.CheckedAt = time.Now().UTC()
 		return nil
 	}); err != nil {
@@ -246,7 +257,7 @@ func TestNewJobRevokesOlderTerminalRollbackAuthority(t *testing.T) {
 	if state.Jobs[first.JobID].RecoveryPoint == nil {
 		t.Fatal("new job revoked the valid rollback before replacing the single backup slot")
 	}
-	if err := NewJobEngine(store, &fakeUpgradeRuntime{}).RunActive(context.Background()); err != nil {
+	if err := NewJobEngine(store, &fakeUpgradeRuntime{digestByVersion: map[string]string{"v1.1.0": "sha256:" + strings.Repeat("a", 64)}}).RunActive(context.Background()); err != nil {
 		t.Fatalf("run second version edge: %v", err)
 	}
 	state, err = store.Load(context.Background())
@@ -562,18 +573,9 @@ func TestIdempotentReplayRecoversAfterPostRenameSyncFailure(t *testing.T) {
 func newTestService(t *testing.T) (*Service, *StateStore) {
 	t.Helper()
 	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
-	manifestData := []byte(validManifestJSON())
-	manifest, err := ValidateManifest(manifestData)
-	if err != nil {
-		t.Fatal(err)
-	}
+	indexData := []byte(validSingleReleaseIndexJSON(t))
 	state := NewRuntimeState()
-	state.Discovery = DiscoveryCache{
-		Status:         DiscoveryFresh,
-		CheckedAt:      time.Now().UTC(),
-		Manifest:       &manifest,
-		ManifestDigest: manifestDigest(manifestData),
-	}
+	state.Discovery = testDiscoveryCache(t, indexData, DiscoveryFresh, time.Now())
 	if err := store.Save(context.Background(), state); err != nil {
 		t.Fatalf("seed discovery: %v", err)
 	}
@@ -581,7 +583,8 @@ func newTestService(t *testing.T) (*Service, *StateStore) {
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	if err := service.RegisterPlan(context.Background(), testPlanToken, Plan{Manifest: manifest, ManifestDigest: state.Discovery.ManifestDigest, CurrentVersion: "v1.0.0", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+	chain := mustUpgradePath(t, *state.Discovery.Index, "v1.0.0")
+	if err := service.RegisterPlan(context.Background(), testPlanToken, Plan{Manifest: *state.Discovery.Manifest, ManifestDigest: state.Discovery.ManifestDigest, CurrentVersion: "v1.0.0", ReleaseChain: chain, ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatalf("RegisterPlan: %v", err)
 	}
 	return service, store

@@ -32,10 +32,12 @@ the application is down.
   job is active.
 - Same-key idempotent replay must recover an already committed job even after
   its plan expires. A new key must never reuse an expired plan.
-- A fresh discovered and validated server Release manifest is required before
+- A fresh checksum-bound `release-index.json` from the latest formal server
+  Release is required before
   issuing a plan. Freshness expires after the frozen 36-hour window; future or
   missing check times fail closed. Client, schema, and upgrade-edge
-  compatibility also fail closed. Plan registration atomically rechecks
+  compatibility also fail closed. Every edge binds the exact source image
+  digest, and an indirect upgrade must have one unambiguous ordered path. Plan registration atomically rechecks
   discovery freshness and host eligibility before returning an operation.
 
 ## Change Workflow

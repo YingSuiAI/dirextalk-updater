@@ -127,6 +127,24 @@ func TestRuntimeStateRejectsInvalidPersistedPlanAndJobState(t *testing.T) {
 	})
 }
 
+func TestRuntimeStateRejectsIntermediateManifestDigestDrift(t *testing.T) {
+	index, err := ValidateReleaseIndex([]byte(validReleaseIndexJSON(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := mustUpgradePath(t, index, "v1.0.0")
+	chain[0].Manifest.SchemaVersion++
+	target := chain[len(chain)-1]
+	state := NewRuntimeState()
+	state.Plans[tokenHash("drifted-chain")] = Plan{
+		Manifest: target.Manifest, ManifestDigest: target.ManifestDigest, CurrentVersion: "v1.0.0",
+		ReleaseChain: chain, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := NewStateStore(filepath.Join(t.TempDir(), "state.json")).Save(context.Background(), state); err == nil {
+		t.Fatal("intermediate manifest drift was accepted without matching its bound digest")
+	}
+}
+
 func TestStateStoreMigratesSchemaOneQueuedJobCurrentVersion(t *testing.T) {
 	manifest, err := ValidateManifest([]byte(validManifestJSON()))
 	if err != nil {
@@ -151,22 +169,62 @@ func TestStateStoreMigratesSchemaOneQueuedJobCurrentVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load schema one state: %v", err)
 	}
-	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 4 {
+	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 5 {
 		t.Fatalf("state schema was not upgraded: %d", migrated.SchemaVersion)
 	}
 	if migrated.Watchdog.Status != WatchdogUnknown {
 		t.Fatalf("watchdog state was not initialized during migration: %#v", migrated.Watchdog)
 	}
 	job := migrated.Jobs["job_1"]
-	if job.CurrentVersion != "v1.0.0" || job.CurrentStep != JobStepValidate || job.TotalSteps != executionTotalSteps {
+	if job.CurrentVersion != "v1.0.0" || job.CurrentStep != JobStepValidate || job.TotalSteps != executionTotalSteps || job.TotalHops != 1 {
 		t.Fatalf("queued job version edge was not restored: %#v", migrated.Jobs["job_1"])
+	}
+	migratedPlan := migrated.Plans[planHash]
+	if !migratedPlan.LegacyUnbound || len(migratedPlan.ReleaseChain) != 1 || migratedPlan.ReleaseChain[0].ManifestDigest != canonicalManifestDigest(manifest) || len(migratedPlan.ReleaseChain[0].SourceImageDigests) != 0 {
+		t.Fatalf("legacy single-manifest plan was not explicitly migrated fail-closed: %#v", migratedPlan)
+	}
+}
+
+func TestStateStoreMigratesSchemaFourSucceededJobProgress(t *testing.T) {
+	manifest, err := ValidateManifest([]byte(validManifestJSON()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := canonicalManifestDigest(manifest)
+	planHash := tokenHash("schema-four-plan")
+	legacy := NewRuntimeState()
+	legacy.SchemaVersion = 4
+	legacy.Plans[planHash] = Plan{Manifest: manifest, ManifestDigest: digest, CurrentVersion: "v1.0.0", ExpiresAt: time.Now().Add(time.Hour)}
+	legacy.Jobs["job_schema4"] = Job{
+		ID: "job_schema4", Status: JobSucceeded, PlanTokenHash: planHash, ManifestDigest: digest,
+		BearerTokenHashes: []string{tokenHash("bearer")}, IdempotencyKey: "schema-four-request",
+		CurrentVersion: "v1.0.0", TargetVersion: manifest.Version, CurrentStep: JobStepComplete,
+		CompletedSteps: executionTotalSteps, TotalSteps: executionTotalSteps, ServiceAvailable: true,
+		LastSafeVersion: manifest.Version, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	legacy.Idempotency["schema-four-request"] = "job_schema4"
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := NewStateStore(path).Load(context.Background())
+	if err != nil {
+		t.Fatalf("load schema four state: %v", err)
+	}
+	job := migrated.Jobs["job_schema4"]
+	if job.CurrentHop != 1 || job.TotalHops != 1 || job.CurrentVersion != manifest.Version || job.CompletedSteps != job.TotalSteps {
+		t.Fatalf("succeeded job progress was not migrated: %#v", job)
 	}
 }
 
 func TestDiscoveryRefreshCachesValidReleaseAndRetainsItOnFailure(t *testing.T) {
 	now := time.Date(2026, 7, 10, 3, 0, 0, 0, time.UTC)
 	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
-	source := &fakeReleaseSource{data: []byte(validManifestJSON())}
+	source := &fakeReleaseSource{data: []byte(validSingleReleaseIndexJSON(t))}
 	cache, err := RefreshDiscovery(context.Background(), store, source, now)
 	if err != nil {
 		t.Fatalf("refresh discovery: %v", err)

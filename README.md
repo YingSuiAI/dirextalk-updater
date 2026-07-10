@@ -58,6 +58,16 @@ bearer-scoped job status route. Compatibility and operation availability are
 server decisions; clients must not infer an upgrade path locally.
 Discovered Release metadata is fresh for at most 36 hours. Older, future, or
 missing check timestamps are treated as stale and cannot issue a plan.
+Discovery accepts only `release-index.json` and `release-index.json.sha256`
+from the latest published stable GitHub Release. The checksum binds the whole
+index; every embedded manifest has its own digest, and every upgrade edge
+binds exact source image digests. A direct edge is preferred. Otherwise the
+path to the latest release must be unique, and the exact ordered chain is
+persisted in the plan before a job is created.
+Both the index and its embedded manifests use deterministic compact JSON so
+their digests can be rechecked after state persistence. Formal source releases
+must remain in the index. The only unindexed bootstrap source is the explicit
+`v0.15.2 -> v1.0.0` legacy edge.
 The `upgrading` desired state is internal to the job transaction, and external
 desired-state changes are rejected while a job is active.
 
@@ -76,6 +86,11 @@ updater restart. After three recovery failures the job enters maintenance and
 offers only the persisted `rollback`/`restart` operations through
 `POST /_dirextalk/updater/v1/jobs/{job_id}/{operation}` with the job bearer.
 No infrastructure parameters are accepted by these routes.
+For a multi-hop plan, each hop independently rotates the single backup,
+activates its immutable image, runs migrations, and passes the complete health
+gate before the next hop starts. An observed source digest mismatch stops
+before target mutation. A later-hop failure restores the most recent healthy
+hop, not the original installation.
 
 The resident process also monitors the fixed Compose project through Docker
 failure events and a 30-second reconciliation loop. Recovery is allowed only

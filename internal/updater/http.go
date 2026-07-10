@@ -136,20 +136,27 @@ func (service *Service) RegisterPlan(ctx context.Context, rawToken string, plan 
 	if strings.TrimSpace(rawToken) == "" {
 		return fmt.Errorf("plan token is required")
 	}
+	if plan.LegacyUnbound {
+		return fmt.Errorf("legacy unbound plans cannot be registered")
+	}
 	if err := plan.Manifest.Validate(); err != nil {
 		return err
 	}
 	if !digestPattern.MatchString(plan.ManifestDigest) {
 		return fmt.Errorf("plan manifest_digest is invalid")
 	}
-	if err := plan.Manifest.ValidateUpgradeFrom(plan.CurrentVersion); err != nil {
+	if len(plan.ReleaseChain) > 0 {
+		if err := validatePlanReleaseChain(plan); err != nil {
+			return err
+		}
+	} else if _, err := parseCanonicalVersion("current_version", plan.CurrentVersion); err != nil {
 		return err
 	}
 	if !plan.ExpiresAt.After(service.now()) {
 		return fmt.Errorf("plan expiry must be in the future")
 	}
 	return service.store.Update(ctx, func(state *RuntimeState) error {
-		if effectiveDiscoveryStatus(state.Discovery, service.now()) != DiscoveryFresh || state.Discovery.Manifest == nil {
+		if effectiveDiscoveryStatus(state.Discovery, service.now()) != DiscoveryFresh || state.Discovery.Manifest == nil || state.Discovery.Index == nil {
 			return fmt.Errorf("a fresh discovered release is required")
 		}
 		if state.DesiredState != DesiredRunning {
@@ -158,8 +165,20 @@ func (service *Service) RegisterPlan(ctx context.Context, rawToken string, plan 
 		if hasActiveJob(*state) {
 			return fmt.Errorf("an operation is already in progress")
 		}
-		if state.Discovery.ManifestDigest != plan.ManifestDigest || !reflect.DeepEqual(*state.Discovery.Manifest, plan.Manifest) {
-			return fmt.Errorf("plan manifest does not match the discovered release")
+		discoveredChain, pathErr := state.Discovery.Index.UpgradePath(plan.CurrentVersion)
+		if len(plan.ReleaseChain) == 0 {
+			plan.ReleaseChain = discoveredChain
+		}
+		if pathErr != nil || !reflect.DeepEqual(discoveredChain, plan.ReleaseChain) || state.Discovery.ManifestDigest != plan.ManifestDigest || !reflect.DeepEqual(*state.Discovery.Manifest, plan.Manifest) {
+			return fmt.Errorf("plan release chain does not match the discovered release index")
+		}
+		if err := validatePlanReleaseChain(plan); err != nil {
+			return err
+		}
+		for _, step := range plan.ReleaseChain {
+			if len(step.SourceImageDigests) == 0 {
+				return fmt.Errorf("plan source image digests are required")
+			}
 		}
 		planHash := tokenHash(rawToken)
 		if existing, ok := state.Plans[planHash]; ok {
@@ -249,6 +268,8 @@ type publicJob struct {
 	CurrentStep      JobStep        `json:"current_step,omitempty"`
 	CompletedSteps   int            `json:"completed_steps"`
 	TotalSteps       int            `json:"total_steps"`
+	CompletedHops    int            `json:"completed_hops"`
+	TotalHops        int            `json:"total_hops"`
 	ServiceAvailable bool           `json:"service_available"`
 	LastSafeVersion  string         `json:"last_safe_version,omitempty"`
 	ErrorCode        string         `json:"error_code,omitempty"`
@@ -358,7 +379,8 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 			CurrentVersion:    plan.CurrentVersion,
 			TargetVersion:     plan.Manifest.Version,
 			CurrentStep:       JobStepValidate,
-			TotalSteps:        executionTotalSteps,
+			TotalSteps:        executionTotalSteps * len(plan.ReleaseChain),
+			TotalHops:         len(plan.ReleaseChain),
 			ServiceAvailable:  true,
 			LastSafeVersion:   plan.CurrentVersion,
 			CreatedAt:         now,
@@ -475,6 +497,8 @@ func publicJobView(job Job) publicJob {
 		CurrentStep:      job.CurrentStep,
 		CompletedSteps:   job.CompletedSteps,
 		TotalSteps:       job.TotalSteps,
+		CompletedHops:    job.CurrentHop,
+		TotalHops:        job.TotalHops,
 		ServiceAvailable: job.ServiceAvailable,
 		LastSafeVersion:  job.LastSafeVersion,
 		ErrorCode:        job.ErrorCode,

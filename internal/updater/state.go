@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
-const RuntimeStateSchemaVersion = 4
+const RuntimeStateSchemaVersion = 5
 
 type DesiredState string
 
@@ -49,14 +51,58 @@ type DiscoveryCache struct {
 	CheckedAt      time.Time       `json:"checked_at,omitempty"`
 	Manifest       *Manifest       `json:"manifest,omitempty"`
 	ManifestDigest string          `json:"manifest_digest,omitempty"`
+	Index          *ReleaseIndex   `json:"release_index,omitempty"`
+	IndexDigest    string          `json:"release_index_digest,omitempty"`
 	ErrorCode      string          `json:"error_code,omitempty"`
 }
 
 type Plan struct {
-	Manifest       Manifest  `json:"manifest"`
-	ManifestDigest string    `json:"manifest_digest"`
-	CurrentVersion string    `json:"current_version"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	Manifest       Manifest      `json:"manifest"`
+	ManifestDigest string        `json:"manifest_digest"`
+	CurrentVersion string        `json:"current_version"`
+	ReleaseChain   []ReleaseStep `json:"release_chain,omitempty"`
+	LegacyUnbound  bool          `json:"legacy_unbound,omitempty"`
+	ExpiresAt      time.Time     `json:"expires_at"`
+}
+
+func validatePlanReleaseChain(plan Plan) error {
+	if len(plan.ReleaseChain) == 0 {
+		return fmt.Errorf("release_chain is required")
+	}
+	current := plan.CurrentVersion
+	for stepNumber, step := range plan.ReleaseChain {
+		if err := step.Manifest.Validate(); err != nil {
+			return fmt.Errorf("step %d manifest: %w", stepNumber, err)
+		}
+		if !digestPattern.MatchString(step.ManifestDigest) {
+			return fmt.Errorf("step %d manifest_digest is invalid", stepNumber)
+		}
+		if canonicalManifestDigest(step.Manifest) != step.ManifestDigest {
+			return fmt.Errorf("step %d manifest_digest mismatch", stepNumber)
+		}
+		if err := step.Manifest.ValidateUpgradeFrom(current); err != nil {
+			return fmt.Errorf("step %d edge: %w", stepNumber, err)
+		}
+		if len(step.SourceImageDigests) == 0 && !plan.LegacyUnbound {
+			return fmt.Errorf("step %d source image digests are required", stepNumber)
+		}
+		if len(step.SourceImageDigests) > 0 {
+			if !sort.StringsAreSorted(step.SourceImageDigests) {
+				return fmt.Errorf("step %d source digests are not sorted", stepNumber)
+			}
+			for digestNumber, digest := range step.SourceImageDigests {
+				if !digestPattern.MatchString(digest) || (digestNumber > 0 && digest == step.SourceImageDigests[digestNumber-1]) {
+					return fmt.Errorf("step %d source digest is invalid or duplicated", stepNumber)
+				}
+			}
+		}
+		current = step.Manifest.Version
+	}
+	target := plan.ReleaseChain[len(plan.ReleaseChain)-1]
+	if !reflect.DeepEqual(target.Manifest, plan.Manifest) || target.ManifestDigest != plan.ManifestDigest {
+		return fmt.Errorf("legacy target fields do not match the final chain step")
+	}
+	return nil
 }
 
 type JobStatus string
@@ -89,6 +135,8 @@ type Job struct {
 	CurrentStep       JobStep         `json:"current_step,omitempty"`
 	CompletedSteps    int             `json:"completed_steps,omitempty"`
 	TotalSteps        int             `json:"total_steps,omitempty"`
+	CurrentHop        int             `json:"current_hop,omitempty"`
+	TotalHops         int             `json:"total_hops,omitempty"`
 	ServiceAvailable  bool            `json:"service_available"`
 	LastSafeVersion   string          `json:"last_safe_version,omitempty"`
 	ErrorCode         string          `json:"error_code,omitempty"`
@@ -201,11 +249,29 @@ func (state *RuntimeState) normalizeAndValidate() error {
 		if !digestPattern.MatchString(state.Discovery.ManifestDigest) {
 			return fmt.Errorf("discovery manifest_digest is invalid")
 		}
+		if state.Discovery.Index != nil {
+			if err := state.Discovery.Index.Validate(); err != nil {
+				return fmt.Errorf("discovery release index is invalid: %w", err)
+			}
+			if !digestPattern.MatchString(state.Discovery.IndexDigest) {
+				return fmt.Errorf("discovery release_index_digest is invalid")
+			}
+			if canonicalReleaseIndexDigest(*state.Discovery.Index) != state.Discovery.IndexDigest {
+				return fmt.Errorf("discovery release_index_digest mismatch")
+			}
+			latest := state.Discovery.Index.Releases[len(state.Discovery.Index.Releases)-1]
+			if !reflect.DeepEqual(latest.Manifest, *state.Discovery.Manifest) || latest.ManifestDigest != state.Discovery.ManifestDigest {
+				return fmt.Errorf("discovery latest manifest does not match release index")
+			}
+		}
 	} else if state.Discovery.Status == DiscoveryFresh {
 		return fmt.Errorf("fresh discovery requires a manifest")
 	}
 	if state.Discovery.Status == DiscoveryFresh && state.Discovery.CheckedAt.IsZero() {
 		return fmt.Errorf("fresh discovery requires checked_at")
+	}
+	if state.Discovery.Status == DiscoveryFresh && state.Discovery.Index == nil {
+		return fmt.Errorf("fresh discovery requires a release index")
 	}
 	for planHash, plan := range state.Plans {
 		if !storedTokenHashValid(planHash) {
@@ -217,8 +283,8 @@ func (state *RuntimeState) normalizeAndValidate() error {
 		if !digestPattern.MatchString(plan.ManifestDigest) {
 			return fmt.Errorf("plan manifest_digest is invalid")
 		}
-		if err := plan.Manifest.ValidateUpgradeFrom(plan.CurrentVersion); err != nil {
-			return fmt.Errorf("plan upgrade edge is invalid: %w", err)
+		if err := validatePlanReleaseChain(plan); err != nil {
+			return fmt.Errorf("plan release chain is invalid: %w", err)
 		}
 		if plan.ExpiresAt.IsZero() {
 			return fmt.Errorf("plan expiry is required")
@@ -235,8 +301,18 @@ func (state *RuntimeState) normalizeAndValidate() error {
 			return fmt.Errorf("job %s references an unknown plan", jobID)
 		}
 		plan := state.Plans[job.PlanTokenHash]
-		if job.ManifestDigest != plan.ManifestDigest || job.CurrentVersion != plan.CurrentVersion || job.TargetVersion != plan.Manifest.Version {
+		if job.ManifestDigest != plan.ManifestDigest || job.TargetVersion != plan.Manifest.Version || job.TotalHops != len(plan.ReleaseChain) {
 			return fmt.Errorf("job %s target does not match its plan", jobID)
+		}
+		if job.CurrentHop < 0 || job.CurrentHop > len(plan.ReleaseChain) {
+			return fmt.Errorf("job %s current hop is invalid", jobID)
+		}
+		expectedCurrent := plan.CurrentVersion
+		if job.CurrentHop > 0 {
+			expectedCurrent = plan.ReleaseChain[job.CurrentHop-1].Manifest.Version
+		}
+		if job.CurrentVersion != expectedCurrent {
+			return fmt.Errorf("job %s current version does not match its completed hop", jobID)
 		}
 		if job.IdempotencyKey == "" || state.Idempotency[job.IdempotencyKey] != jobID {
 			return fmt.Errorf("job %s idempotency mapping is invalid", jobID)
@@ -362,6 +438,41 @@ func migrateRuntimeState(state *RuntimeState) error {
 		fallthrough
 	case 3:
 		state.Watchdog = WatchdogState{Status: WatchdogUnknown}
+		state.SchemaVersion = 4
+		fallthrough
+	case 4:
+		for planHash, plan := range state.Plans {
+			if len(plan.ReleaseChain) == 0 {
+				plan.ManifestDigest = canonicalManifestDigest(plan.Manifest)
+				plan.ReleaseChain = []ReleaseStep{{Manifest: plan.Manifest, ManifestDigest: plan.ManifestDigest}}
+				plan.LegacyUnbound = true
+				state.Plans[planHash] = plan
+			}
+		}
+		for jobID, job := range state.Jobs {
+			plan := state.Plans[job.PlanTokenHash]
+			job.ManifestDigest = plan.ManifestDigest
+			if job.TotalHops == 0 {
+				job.TotalHops = len(plan.ReleaseChain)
+			}
+			if job.TotalSteps == executionTotalSteps && job.TotalHops > 1 {
+				job.TotalSteps = executionTotalSteps * job.TotalHops
+			}
+			if job.Status == JobSucceeded {
+				job.CurrentHop = job.TotalHops
+				job.CurrentVersion = job.TargetVersion
+				job.CompletedSteps = job.TotalSteps
+			} else if job.Status == JobRolledBack {
+				job.CurrentHop = completedHopForVersion(plan, job.LastSafeVersion)
+				job.CurrentVersion = job.LastSafeVersion
+				job.CompletedSteps = job.CurrentHop * executionTotalSteps
+			}
+			state.Jobs[jobID] = job
+		}
+		if state.Discovery.Status == DiscoveryFresh && state.Discovery.Index == nil {
+			state.Discovery.Status = DiscoveryStale
+			state.Discovery.ErrorCode = "release_index_refresh_required"
+		}
 		state.SchemaVersion = RuntimeStateSchemaVersion
 		return nil
 	default:

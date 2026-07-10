@@ -26,7 +26,7 @@ func TestComposeRuntimePreparesAndCommitsCompleteRecoveryPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := Job{ID: "job_backup", CurrentVersion: "v1.0.0"}
-	plan := Plan{Manifest: manifest, CurrentVersion: job.CurrentVersion}
+	plan := testBackupPlan(manifest, job.CurrentVersion, "sha256:"+strings.Repeat("1", 64))
 
 	metadata, err := runtime.PrepareBackup(context.Background(), job, plan, ignoreProgress)
 	if err != nil {
@@ -49,6 +49,60 @@ func TestComposeRuntimePreparesAndCommitsCompleteRecoveryPoint(t *testing.T) {
 		" up -d --no-deps message-server",
 		"{{.State.Status}}",
 	})
+}
+
+func TestComposeRuntimeRejectsUntrustedSourceDigestBeforeStoppingOrRotatingBackup(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	paths := testHostPaths(t, root)
+	runner := &fakeHostCommandRunner{}
+	runtime := newTestComposeRuntime(paths, runner)
+	manifest, err := ValidateManifest([]byte(validManifestJSON()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := stageCompleteBackup(t, runtime.backups, "job_old", "v0.9.0")
+	if err := runtime.backups.Commit(context.Background(), old); err != nil {
+		t.Fatal(err)
+	}
+	plan := testBackupPlan(manifest, "v1.0.0", "sha256:"+strings.Repeat("f", 64))
+	if _, err := runtime.PrepareBackup(context.Background(), Job{ID: "job_untrusted", CurrentVersion: "v1.0.0"}, plan, ignoreProgress); err == nil {
+		t.Fatal("expected source digest mismatch")
+	}
+	for _, call := range runner.calls {
+		if strings.Contains(call, " stop message-server") || strings.Contains(call, " pg_dump ") {
+			t.Fatalf("untrusted source reached disruptive backup commands: %#v", runner.calls)
+		}
+	}
+	current, err := runtime.backups.Current(context.Background())
+	if err != nil || current.Version != "v0.9.0" {
+		t.Fatalf("untrusted source replaced prior recovery point: current=%#v err=%v", current, err)
+	}
+}
+
+func TestComposeRuntimeNormalizesOnlyLegacyBareHealthVersion(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	paths := testHostPaths(t, root)
+	digest := "sha256:d57a0b7830f7248e29fe7c45c0848cb1167454709fd33effe07ff074415f571c"
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+pinnedImageRef(legacyInitialVersion, digest)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{
+		imageRef:   pinnedImageRef(legacyInitialVersion, digest),
+		healthJSON: `{"status":"ok","version":"0.15.2","schema_version":1,"schema_compat_version":1}`,
+	}
+	runtime := newTestComposeRuntime(paths, runner)
+	version, observedDigest, health, err := runtime.ensureSourceReady(context.Background(), legacyInitialVersion)
+	if err != nil {
+		t.Fatalf("legacy bare health version was not normalized: %v", err)
+	}
+	if version != legacyInitialVersion || observedDigest != digest || health.Version != "0.15.2" {
+		t.Fatalf("unexpected legacy source identity: version=%s digest=%s health=%#v", version, observedDigest, health)
+	}
+	if healthVersionMatches("v1.0.0", "1.0.0") {
+		t.Fatal("bare version normalization escaped the one legacy version")
+	}
 }
 
 func TestComposeRuntimeActivatesOnlyManifestDigestAndAtomicallyUpdatesEnv(t *testing.T) {
@@ -153,7 +207,7 @@ func TestComposeRuntimeRestoresOnlyTheCommittedRecoveryPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := Job{ID: "job_restore", CurrentVersion: "v1.0.0"}
-	recovery, err := runtime.PrepareBackup(context.Background(), job, Plan{Manifest: manifest, CurrentVersion: job.CurrentVersion}, ignoreProgress)
+	recovery, err := runtime.PrepareBackup(context.Background(), job, testBackupPlan(manifest, job.CurrentVersion, "sha256:"+strings.Repeat("1", 64)), ignoreProgress)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +262,7 @@ func TestComposeRuntimeBackupFailureRestartsSourceAndPreservesCommittedBackup(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = runtime.PrepareBackup(context.Background(), Job{ID: "job_new", CurrentVersion: "v1.0.0"}, Plan{Manifest: manifest, CurrentVersion: "v1.0.0"}, ignoreProgress)
+	_, err = runtime.PrepareBackup(context.Background(), Job{ID: "job_new", CurrentVersion: "v1.0.0"}, testBackupPlan(manifest, "v1.0.0", "sha256:"+strings.Repeat("1", 64)), ignoreProgress)
 	if err == nil {
 		t.Fatal("expected staged archive failure")
 	}
@@ -240,7 +294,7 @@ func TestComposeRuntimeResumesBackupByRecoveringAStoppedSourceFirst(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.PrepareBackup(context.Background(), Job{ID: "job_resume", CurrentVersion: "v1.0.0"}, Plan{Manifest: manifest, CurrentVersion: "v1.0.0"}, ignoreProgress); err != nil {
+	if _, err := runtime.PrepareBackup(context.Background(), Job{ID: "job_resume", CurrentVersion: "v1.0.0"}, testBackupPlan(manifest, "v1.0.0", "sha256:"+strings.Repeat("1", 64)), ignoreProgress); err != nil {
 		t.Fatalf("resume backup from stopped source: %v", err)
 	}
 	if len(runner.calls) == 0 || !strings.Contains(runner.calls[0], " up -d --no-deps message-server") {
@@ -265,7 +319,7 @@ func TestComposeRuntimeDoesNotFsyncDiscardedStagingAfterCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.PrepareBackup(context.Background(), Job{ID: "job_no_defer", CurrentVersion: "v1.0.0"}, Plan{Manifest: manifest, CurrentVersion: "v1.0.0"}, ignoreProgress); err != nil {
+	if _, err := runtime.PrepareBackup(context.Background(), Job{ID: "job_no_defer", CurrentVersion: "v1.0.0"}, testBackupPlan(manifest, "v1.0.0", "sha256:"+strings.Repeat("1", 64)), ignoreProgress); err != nil {
 		t.Fatalf("committed backup was turned into an ambiguous error: %v", err)
 	}
 	if syncCalls != 3 {
@@ -442,6 +496,11 @@ func testHostPaths(t *testing.T, root string) composeRuntimePaths {
 }
 
 func ignoreProgress(JobStatus) error { return nil }
+
+func testBackupPlan(manifest Manifest, currentVersion, sourceDigest string) Plan {
+	step := ReleaseStep{Manifest: manifest, ManifestDigest: canonicalManifestDigest(manifest), SourceImageDigests: []string{sourceDigest}}
+	return Plan{Manifest: manifest, ManifestDigest: step.ManifestDigest, CurrentVersion: currentVersion, ReleaseChain: []ReleaseStep{step}}
+}
 
 func newTestComposeRuntime(paths composeRuntimePaths, runner *fakeHostCommandRunner) *ComposeRuntime {
 	runtime := newComposeRuntime(paths, runner, nil)

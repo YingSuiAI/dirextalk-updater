@@ -154,6 +154,12 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 	if job.ID == "" || job.CurrentVersion != plan.CurrentVersion {
 		return BackupMetadata{}, fmt.Errorf("job and plan source do not match")
 	}
+	if len(plan.ReleaseChain) != 1 {
+		return BackupMetadata{}, fmt.Errorf("backup requires exactly one bound release step")
+	}
+	if err := validatePlanReleaseChain(plan); err != nil {
+		return BackupMetadata{}, fmt.Errorf("backup release step is invalid: %w", err)
+	}
 	if progress == nil {
 		return BackupMetadata{}, fmt.Errorf("backup progress callback is required")
 	}
@@ -163,6 +169,9 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 	version, digest, health, err := runtime.ensureSourceReady(ctx, job.CurrentVersion)
 	if err != nil {
 		return BackupMetadata{}, err
+	}
+	if !digestAllowed(digest, plan.ReleaseChain[0].SourceImageDigests) {
+		return BackupMetadata{}, errUntrustedSourceImageDigest
 	}
 	if err := progress(JobBackingUp); err != nil {
 		return BackupMetadata{}, err
@@ -643,7 +652,7 @@ func (runtime *ComposeRuntime) checkCurrentHealth(ctx context.Context, version, 
 	if err != nil {
 		return runtimeHealth{}, err
 	}
-	if health.Status != "ok" || health.Version != version || health.SchemaVersion < 1 || health.SchemaCompatVersion < 1 || health.SchemaCompatVersion > health.SchemaVersion {
+	if health.Status != "ok" || !healthVersionMatches(version, health.Version) || health.SchemaVersion < 1 || health.SchemaCompatVersion < 1 || health.SchemaCompatVersion > health.SchemaVersion {
 		return runtimeHealth{}, fmt.Errorf("message-server build health does not match expected release")
 	}
 	domain, err := readEnvironmentValue(runtime.paths.envFile, "DOMAIN")
@@ -658,6 +667,13 @@ func (runtime *ComposeRuntime) checkCurrentHealth(ctx context.Context, version, 
 		return runtimeHealth{}, fmt.Errorf("Caddy public health does not match internal health")
 	}
 	return health, nil
+}
+
+func healthVersionMatches(expected, observed string) bool {
+	if observed == expected {
+		return true
+	}
+	return expected == legacyInitialVersion && observed == strings.TrimPrefix(legacyInitialVersion, "v")
 }
 
 func (runtime *ComposeRuntime) fetchPublicHealth(ctx context.Context, domain string) (runtimeHealth, error) {

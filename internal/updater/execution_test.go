@@ -39,6 +39,109 @@ func TestJobEngineRunsBackupActivationAndHealthInOrder(t *testing.T) {
 	}
 }
 
+func TestJobEngineExecutesEveryPersistedReleaseHopAndRotatesBackup(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedMultiHopExecutionJob(t)
+	runtime := &fakeUpgradeRuntime{digestByVersion: map[string]string{
+		"v1.0.0": "sha256:" + strings.Repeat("0", 64),
+		"v1.1.0": "sha256:" + strings.Repeat("a", 64),
+	}}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err != nil {
+		t.Fatalf("run multi-hop job: %v", err)
+	}
+	wantCalls := []string{"prepare_backup", "activate_target", "check_target", "prepare_backup", "activate_target", "check_target"}
+	if !reflect.DeepEqual(runtime.calls, wantCalls) {
+		t.Fatalf("multi-hop calls = %#v, want %#v", runtime.calls, wantCalls)
+	}
+	if !reflect.DeepEqual(runtime.backupVersions, []string{"v1.0.0", "v1.1.0"}) || !reflect.DeepEqual(runtime.targetVersions, []string{"v1.1.0", "v1.2.0"}) {
+		t.Fatalf("unexpected hop identities: backups=%#v targets=%#v", runtime.backupVersions, runtime.targetVersions)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := state.Jobs[jobID]
+	if job.Status != JobSucceeded || job.CurrentVersion != "v1.2.0" || job.LastSafeVersion != "v1.2.0" || job.CurrentHop != 2 || job.TotalHops != 2 || job.CompletedSteps != 2*executionTotalSteps {
+		t.Fatalf("unexpected multi-hop completion: %#v", job)
+	}
+	if job.RecoveryPoint == nil || job.RecoveryPoint.Version != "v1.1.0" {
+		t.Fatalf("final rollback slot must restore most recent safe hop: %#v", job.RecoveryPoint)
+	}
+}
+
+func TestJobEngineSecondHopFailureRollsBackToMostRecentSafeHop(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedMultiHopExecutionJob(t)
+	runtime := &fakeUpgradeRuntime{
+		digestByVersion:   map[string]string{"v1.0.0": "sha256:" + strings.Repeat("0", 64), "v1.1.0": "sha256:" + strings.Repeat("a", 64)},
+		checkTargetErrors: map[string]error{"v1.2.0": errors.New("second hop unhealthy")},
+	}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err == nil {
+		t.Fatal("expected second-hop failure")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := state.Jobs[jobID]
+	if job.Status != JobRolledBack || job.LastSafeVersion != "v1.1.0" || job.CurrentVersion != "v1.1.0" || job.RecoveryPoint == nil || job.RecoveryPoint.Version != "v1.1.0" {
+		t.Fatalf("second hop did not roll back to latest safe release: %#v", job)
+	}
+}
+
+func TestJobEngineRejectsObservedSourceDigestBeforeTargetMutation(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedExecutionJob(t)
+	runtime := &fakeUpgradeRuntime{digestByVersion: map[string]string{"v1.0.0": "sha256:" + strings.Repeat("f", 64)}}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err == nil {
+		t.Fatal("expected untrusted source digest rejection")
+	}
+	if !reflect.DeepEqual(runtime.calls, []string{"prepare_backup"}) {
+		t.Fatalf("target mutation was attempted: %#v", runtime.calls)
+	}
+	state, _ := store.Load(context.Background())
+	job := state.Jobs[jobID]
+	if job.Status != JobFailed || job.ErrorCode != "source_image_digest_untrusted" || !job.ServiceAvailable {
+		t.Fatalf("source digest mismatch did not fail closed: %#v", job)
+	}
+}
+
+func TestJobEngineFailsClosedWhenLegacyPersistedPlanResumesAfterBackup(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedExecutionJob(t)
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		job := state.Jobs[jobID]
+		plan := state.Plans[job.PlanTokenHash]
+		plan.ReleaseChain[0].SourceImageDigests = nil
+		plan.LegacyUnbound = true
+		state.Plans[job.PlanTokenHash] = plan
+		job.Status = JobPulling
+		job.CurrentStep = JobStepPulling
+		job.CompletedSteps = 2
+		job.RecoveryPoint = &BackupMetadata{
+			SchemaVersion: BackupMetadataSchemaVersion, JobID: job.ID, Version: job.CurrentVersion,
+			ImageDigest: "sha256:" + strings.Repeat("1", 64), ImageRef: AllowedImageRepository + ":v1.0.0@sha256:" + strings.Repeat("1", 64),
+			DatabaseSchema: 1, SchemaCompatVersion: 1, CreatedAt: time.Now().UTC(),
+			Artifacts: []BackupArtifact{{Name: "message-config.tar", Size: 1, SHA256: strings.Repeat("a", 64)}, {Name: "message-data.tar", Size: 1, SHA256: strings.Repeat("b", 64)}, {Name: "p2p.tar", Size: 1, SHA256: strings.Repeat("c", 64)}, {Name: "postgres.dump", Size: 1, SHA256: strings.Repeat("d", 64)}},
+		}
+		state.Jobs[jobID] = job
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeUpgradeRuntime{}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err == nil {
+		t.Fatal("expected legacy unbound release path to fail closed")
+	}
+	if len(runtime.calls) != 0 {
+		t.Fatalf("legacy unbound path reached host mutation: %#v", runtime.calls)
+	}
+	state, _ := store.Load(context.Background())
+	if job := state.Jobs[jobID]; job.Status != JobFailed || job.ErrorCode != "source_image_digest_untrusted" || !job.ServiceAvailable {
+		t.Fatalf("legacy path was not stopped safely: %#v", job)
+	}
+}
+
 func TestJobProgressReportsPlannedDowntimeDuringBackup(t *testing.T) {
 	t.Parallel()
 	store, jobID := seedQueuedExecutionJob(t)
@@ -162,6 +265,19 @@ func TestJobEngineBackupFailureLeavesServiceRunningWithoutRollback(t *testing.T)
 	job := state.Jobs[jobID]
 	if job.Status != JobFailed || !job.ServiceAvailable || job.ErrorCode != "backup_failed" || state.DesiredState != DesiredRunning {
 		t.Fatalf("unsafe backup failure state: %#v / %q", job, state.DesiredState)
+	}
+}
+
+func TestJobEnginePreservesUntrustedSourceDigestErrorCodeFromRuntime(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedExecutionJob(t)
+	runtime := &fakeUpgradeRuntime{prepareErr: errUntrustedSourceImageDigest}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err == nil {
+		t.Fatal("expected source digest precheck failure")
+	}
+	state, _ := store.Load(context.Background())
+	if job := state.Jobs[jobID]; job.Status != JobFailed || job.ErrorCode != "source_image_digest_untrusted" || !job.ServiceAvailable {
+		t.Fatalf("source digest error code was lost: %#v", job)
 	}
 }
 
@@ -308,18 +424,23 @@ func TestJobEngineCompletesPersistedRestartOperation(t *testing.T) {
 }
 
 type fakeUpgradeRuntime struct {
-	calls           []string
-	phases          []JobStatus
-	prepareErr      error
-	activateErr     error
-	activateMutated bool
-	checkTargetErr  error
-	restoreErr      error
-	checkRestoreErr error
+	calls             []string
+	phases            []JobStatus
+	prepareErr        error
+	activateErr       error
+	activateMutated   bool
+	checkTargetErr    error
+	restoreErr        error
+	checkRestoreErr   error
+	digestByVersion   map[string]string
+	checkTargetErrors map[string]error
+	backupVersions    []string
+	targetVersions    []string
 }
 
 func (runtime *fakeUpgradeRuntime) PrepareBackup(_ context.Context, job Job, _ Plan, progress func(JobStatus) error) (BackupMetadata, error) {
 	runtime.calls = append(runtime.calls, "prepare_backup")
+	runtime.backupVersions = append(runtime.backupVersions, job.CurrentVersion)
 	if err := progress(JobValidating); err != nil {
 		return BackupMetadata{}, err
 	}
@@ -331,12 +452,16 @@ func (runtime *fakeUpgradeRuntime) PrepareBackup(_ context.Context, job Job, _ P
 	if runtime.prepareErr != nil {
 		return BackupMetadata{}, runtime.prepareErr
 	}
+	digest := "sha256:" + strings.Repeat("1", 64)
+	if runtime.digestByVersion != nil && runtime.digestByVersion[job.CurrentVersion] != "" {
+		digest = runtime.digestByVersion[job.CurrentVersion]
+	}
 	return BackupMetadata{
 		SchemaVersion:       BackupMetadataSchemaVersion,
 		JobID:               job.ID,
 		Version:             job.CurrentVersion,
-		ImageDigest:         "sha256:" + strings.Repeat("1", 64),
-		ImageRef:            AllowedImageRepository + ":" + job.CurrentVersion + "@sha256:" + strings.Repeat("1", 64),
+		ImageDigest:         digest,
+		ImageRef:            AllowedImageRepository + ":" + job.CurrentVersion + "@" + digest,
 		DatabaseSchema:      1,
 		SchemaCompatVersion: 1,
 		CreatedAt:           time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
@@ -349,8 +474,9 @@ func (runtime *fakeUpgradeRuntime) PrepareBackup(_ context.Context, job Job, _ P
 	}, nil
 }
 
-func (runtime *fakeUpgradeRuntime) ActivateTarget(_ context.Context, _ Manifest, progress func(JobStatus) error) error {
+func (runtime *fakeUpgradeRuntime) ActivateTarget(_ context.Context, manifest Manifest, progress func(JobStatus) error) error {
 	runtime.calls = append(runtime.calls, "activate_target")
+	runtime.targetVersions = append(runtime.targetVersions, manifest.Version)
 	if runtime.activateErr != nil && !runtime.activateMutated {
 		return runtime.activateErr
 	}
@@ -366,8 +492,11 @@ func (runtime *fakeUpgradeRuntime) ActivateTarget(_ context.Context, _ Manifest,
 	return nil
 }
 
-func (runtime *fakeUpgradeRuntime) CheckTarget(_ context.Context, _ Manifest) error {
+func (runtime *fakeUpgradeRuntime) CheckTarget(_ context.Context, manifest Manifest) error {
 	runtime.calls = append(runtime.calls, "check_target")
+	if runtime.checkTargetErrors != nil && runtime.checkTargetErrors[manifest.Version] != nil {
+		return runtime.checkTargetErrors[manifest.Version]
+	}
 	return runtime.checkTargetErr
 }
 
@@ -396,29 +525,60 @@ func seedQueuedExecutionJob(t *testing.T) (*StateStore, string) {
 	}
 	planHash := strings.Repeat("a", 64)
 	jobID := "job_execution"
+	manifestDigest := canonicalManifestDigest(manifest)
 	state.Plans[planHash] = Plan{
 		Manifest:       manifest,
-		ManifestDigest: "sha256:" + strings.Repeat("b", 64),
+		ManifestDigest: manifestDigest,
 		CurrentVersion: "v1.0.0",
+		ReleaseChain:   []ReleaseStep{{Manifest: manifest, ManifestDigest: manifestDigest, SourceImageDigests: []string{"sha256:" + strings.Repeat("1", 64)}}},
 		ExpiresAt:      time.Now().Add(time.Hour),
 	}
 	state.Jobs[jobID] = Job{
 		ID:                jobID,
 		Status:            JobQueued,
 		PlanTokenHash:     planHash,
-		ManifestDigest:    "sha256:" + strings.Repeat("b", 64),
+		ManifestDigest:    manifestDigest,
 		BearerTokenHashes: []string{strings.Repeat("c", 64)},
 		IdempotencyKey:    "execution-test",
 		CurrentVersion:    "v1.0.0",
 		TargetVersion:     "v1.1.0",
 		CurrentStep:       JobStepValidate,
 		TotalSteps:        executionTotalSteps,
+		TotalHops:         1,
 		ServiceAvailable:  true,
 		LastSafeVersion:   "v1.0.0",
 		CreatedAt:         time.Now().UTC(),
 		UpdatedAt:         time.Now().UTC(),
 	}
 	state.Idempotency["execution-test"] = jobID
+	state.DesiredState = DesiredUpgrading
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	return store, jobID
+}
+
+func seedQueuedMultiHopExecutionJob(t *testing.T) (*StateStore, string) {
+	t.Helper()
+	store := NewStateStore(t.TempDir() + "/runtime.json")
+	index, err := ValidateReleaseIndex([]byte(validReleaseIndexJSON(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := mustUpgradePath(t, index, "v1.0.0")
+	state := NewRuntimeState()
+	planHash := strings.Repeat("d", 64)
+	jobID := "job_multihop"
+	target := chain[len(chain)-1]
+	state.Plans[planHash] = Plan{Manifest: target.Manifest, ManifestDigest: target.ManifestDigest, CurrentVersion: "v1.0.0", ReleaseChain: chain, ExpiresAt: time.Now().Add(time.Hour)}
+	state.Jobs[jobID] = Job{
+		ID: jobID, Status: JobQueued, PlanTokenHash: planHash, ManifestDigest: target.ManifestDigest,
+		BearerTokenHashes: []string{strings.Repeat("e", 64)}, IdempotencyKey: "execution-multihop",
+		CurrentVersion: "v1.0.0", TargetVersion: target.Manifest.Version, CurrentStep: JobStepValidate,
+		TotalSteps: len(chain) * executionTotalSteps, TotalHops: len(chain), ServiceAvailable: true,
+		LastSafeVersion: "v1.0.0", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	state.Idempotency["execution-multihop"] = jobID
 	state.DesiredState = DesiredUpgrading
 	if err := store.Save(context.Background(), state); err != nil {
 		t.Fatal(err)

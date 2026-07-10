@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,45 @@ func TestControlStatusUsesOnlyCachedDiscoveryAndCreatesRestartSafePlan(t *testin
 		if _, ok := fields[field]; !ok {
 			t.Fatalf("missing status response field %q: %s", field, rawResponse)
 		}
+	}
+}
+
+func TestControlStatusPersistsExactMultiHopPlanFromReleaseIndex(t *testing.T) {
+	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
+	checkedAt := time.Date(2026, 7, 10, 3, 0, 0, 0, time.UTC)
+	indexData := []byte(validReleaseIndexJSON(t))
+	if _, err := RefreshDiscovery(context.Background(), store, releaseSourceFunc(func(context.Context) ([]byte, error) {
+		return indexData, nil
+	}), checkedAt); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(store, testControlToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return checkedAt.Add(time.Hour) }
+	response := postJSON(t, service.Handler(), controlStatusPath, compatibleStatusRequest, testControlToken, "")
+	var status StatusResponse
+	decodeResponse(t, response, &status)
+	if len(status.Operations) != 1 || status.Operations[0].TargetVersion != "v1.2.0" {
+		t.Fatalf("multi-hop update was not offered: %#v", status)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := state.Plans[tokenHash(status.Operations[0].PlanToken)]
+	if len(plan.ReleaseChain) != 2 || plan.ReleaseChain[0].Manifest.Version != "v1.1.0" || plan.ReleaseChain[1].Manifest.Version != "v1.2.0" {
+		t.Fatalf("exact ordered chain was not persisted: %#v", plan)
+	}
+	state.Discovery.Index = nil
+	state.Discovery.Status = DiscoveryStale
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := store.Load(context.Background())
+	if err != nil || !reflect.DeepEqual(persisted.Plans[tokenHash(status.Operations[0].PlanToken)].ReleaseChain, plan.ReleaseChain) {
+		t.Fatalf("discovery drift altered persisted release chain: err=%v state=%#v", err, persisted)
 	}
 }
 
@@ -260,7 +300,9 @@ func TestControlStatusRequiresCurrentSchemaInsideTargetCompatibilityWindow(t *te
 		t.Fatal(err)
 	}
 	state.Discovery.Manifest = &manifest
-	state.Discovery.ManifestDigest = manifestDigest(manifestData)
+	state.Discovery.ManifestDigest = canonicalManifestDigest(manifest)
+	state.Discovery.Index.Releases[len(state.Discovery.Index.Releases)-1] = IndexedRelease{Manifest: manifest, ManifestDigest: state.Discovery.ManifestDigest}
+	state.Discovery.IndexDigest = canonicalReleaseIndexDigest(*state.Discovery.Index)
 	if err := store.Save(context.Background(), state); err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +359,7 @@ func TestControlStatusRemovesOnlyExpiredUnreferencedPlans(t *testing.T) {
 		plan.ExpiresAt = service.now().Add(-time.Minute)
 		state.Plans[referencedHash] = plan
 	}
-	state.Plans[tokenHash("expired-plan")] = Plan{Manifest: *state.Discovery.Manifest, ManifestDigest: state.Discovery.ManifestDigest, CurrentVersion: "v1.0.0", ExpiresAt: service.now().Add(-time.Minute)}
+	state.Plans[tokenHash("expired-plan")] = Plan{Manifest: *state.Discovery.Manifest, ManifestDigest: state.Discovery.ManifestDigest, CurrentVersion: "v1.0.0", ReleaseChain: mustUpgradePath(t, *state.Discovery.Index, "v1.0.0"), ExpiresAt: service.now().Add(-time.Minute)}
 	if err := store.Save(context.Background(), state); err != nil {
 		t.Fatal(err)
 	}
@@ -342,12 +384,8 @@ func newStatusTestService(t *testing.T, discoveryStatus DiscoveryStatus) (*Servi
 	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
 	state := NewRuntimeState()
 	if discoveryStatus == DiscoveryFresh || discoveryStatus == DiscoveryStale {
-		data := []byte(validManifestJSON())
-		manifest, err := ValidateManifest(data)
-		if err != nil {
-			t.Fatal(err)
-		}
-		state.Discovery = DiscoveryCache{Status: discoveryStatus, CheckedAt: time.Date(2026, 7, 10, 3, 0, 0, 0, time.UTC), Manifest: &manifest, ManifestDigest: manifestDigest(data)}
+		data := []byte(validSingleReleaseIndexJSON(t))
+		state.Discovery = testDiscoveryCache(t, data, discoveryStatus, time.Date(2026, 7, 10, 3, 0, 0, 0, time.UTC))
 	} else {
 		state.Discovery = DiscoveryCache{Status: discoveryStatus, CheckedAt: time.Date(2026, 7, 10, 3, 0, 0, 0, time.UTC)}
 	}

@@ -10,6 +10,8 @@ import (
 const executionTotalSteps = 7
 const maxRecoveryAttempts = 3
 
+var errUntrustedSourceImageDigest = errors.New("observed source image digest is not trusted by the release edge")
+
 type JobStep string
 
 const (
@@ -60,8 +62,8 @@ func (job Job) validateExecutionState() error {
 		return fmt.Errorf("recovery attempts are invalid")
 	}
 	if job.Status.active() {
-		if job.TotalSteps != executionTotalSteps {
-			return fmt.Errorf("active job total_steps must be %d", executionTotalSteps)
+		if job.TotalHops < 1 || job.CurrentHop < 0 || job.CurrentHop >= job.TotalHops || job.TotalSteps != executionTotalSteps*job.TotalHops {
+			return fmt.Errorf("active job hop progress is invalid")
 		}
 		if job.CurrentStep == "" {
 			return fmt.Errorf("active job current_step is required")
@@ -80,8 +82,8 @@ func (job Job) validateExecutionState() error {
 		if err := validateBackupMetadataShape(*job.RecoveryPoint); err != nil {
 			return fmt.Errorf("recovery point: %w", err)
 		}
-		if job.RecoveryPoint.JobID != job.ID || job.RecoveryPoint.Version != job.CurrentVersion {
-			return fmt.Errorf("recovery point does not match the job source")
+		if job.RecoveryPoint.JobID != job.ID {
+			return fmt.Errorf("recovery point does not match the job")
 		}
 	}
 	if job.Status == JobSucceeded || job.Status == JobFailed || job.Status == JobRolledBack {
@@ -91,6 +93,9 @@ func (job Job) validateExecutionState() error {
 	}
 	if job.Status == JobSucceeded && (!job.ServiceAvailable || job.ErrorCode != "" || job.ErrorMessage != "") {
 		return fmt.Errorf("succeeded job has inconsistent availability or error")
+	}
+	if job.Status == JobSucceeded && (job.CurrentHop != job.TotalHops || job.CompletedSteps != job.TotalSteps || job.CurrentVersion != job.TargetVersion) {
+		return fmt.Errorf("succeeded job has incomplete release progress")
 	}
 	if (job.Status == JobFailed || job.Status == JobRolledBack) && job.ErrorCode == "" {
 		return fmt.Errorf("failed or rolled back job requires error_code")
@@ -123,109 +128,165 @@ func (engine *JobEngine) RunActive(ctx context.Context) error {
 	if engine == nil || engine.store == nil || engine.runtime == nil {
 		return fmt.Errorf("job engine is not configured")
 	}
-	job, plan, found, err := engine.activeJob(ctx)
-	if err != nil || !found {
-		return err
-	}
-	if job.Status == JobQueued {
-		if err := engine.updateJob(ctx, job.ID, func(job *Job, _ *RuntimeState) {
-			job.Status = JobValidating
-			job.CurrentStep = JobStepValidate
-		}); err != nil {
+	for {
+		job, plan, found, err := engine.activeJob(ctx)
+		if err != nil || !found {
 			return err
 		}
-		job.Status = JobValidating
-		job.CurrentStep = JobStepValidate
-	}
-	if job.Status == JobRollingBack {
-		return engine.resumeRollback(ctx, job)
-	}
-	if job.Status == JobRestarting {
-		return engine.resumeRestart(ctx, job)
-	}
+		if job.Status == JobQueued {
+			if err := engine.updateJob(ctx, job.ID, func(job *Job, _ *RuntimeState) {
+				job.Status = JobValidating
+				job.CurrentStep = JobStepValidate
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if job.Status == JobRollingBack {
+			return engine.resumeRollback(ctx, job)
+		}
+		if job.Status == JobRestarting {
+			return engine.resumeRestart(ctx, job)
+		}
+		if job.CurrentHop < 0 || job.CurrentHop >= len(plan.ReleaseChain) {
+			return fmt.Errorf("active job %s has invalid current hop", job.ID)
+		}
+		step := plan.ReleaseChain[job.CurrentHop]
+		hopPlan := Plan{Manifest: step.Manifest, ManifestDigest: step.ManifestDigest, CurrentVersion: job.CurrentVersion, ReleaseChain: []ReleaseStep{step}, ExpiresAt: plan.ExpiresAt}
+		stepBase := job.CurrentHop * executionTotalSteps
+		if len(step.SourceImageDigests) == 0 {
+			cause := fmt.Errorf("persisted release path does not bind a trusted source image digest")
+			if job.RecoveryPoint != nil && (job.Status == JobStopping || job.Status == JobMigrating || job.Status == JobStarting || job.Status == JobHealthCheck) {
+				return engine.beginAndRunRollback(ctx, job, "source_image_digest_untrusted", cause)
+			}
+			persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "source_image_digest_untrusted", job.ServiceAvailable)
+			return errors.Join(cause, persistErr)
+		}
 
-	switch job.Status {
-	case JobValidating, JobBackingUp:
-		recovery, prepareErr := engine.runtime.PrepareBackup(ctx, job, plan, engine.progress(ctx, job.ID))
-		if prepareErr != nil {
-			if err := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_failed", errorServiceAvailable(prepareErr)); err != nil {
-				return errors.Join(prepareErr, err)
-			}
-			return fmt.Errorf("prepare recovery point: %w", prepareErr)
-		}
-		if err := validateBackupMetadataShape(recovery); err != nil {
-			validationErr := fmt.Errorf("prepared recovery point is invalid: %w", err)
-			if persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_invalid", true); persistErr != nil {
-				return errors.Join(validationErr, persistErr)
-			}
-			return validationErr
-		}
-		if recovery.JobID != job.ID || recovery.Version != job.CurrentVersion {
-			validationErr := fmt.Errorf("prepared recovery point does not match job")
-			if persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_invalid", true); persistErr != nil {
-				return errors.Join(validationErr, persistErr)
-			}
-			return validationErr
-		}
-		if err := engine.updateJob(ctx, job.ID, func(job *Job, state *RuntimeState) {
-			for priorID, prior := range state.Jobs {
-				if priorID != job.ID && !prior.Status.active() && prior.RecoveryPoint != nil {
-					prior.RecoveryPoint = nil
-					state.Jobs[priorID] = prior
+		switch job.Status {
+		case JobValidating, JobBackingUp:
+			recovery, prepareErr := engine.runtime.PrepareBackup(ctx, job, hopPlan, engine.progress(ctx, job.ID))
+			if prepareErr != nil {
+				code := "backup_failed"
+				if errors.Is(prepareErr, errUntrustedSourceImageDigest) {
+					code = "source_image_digest_untrusted"
 				}
+				if err := engine.finishBeforeMutationFailure(ctx, job.ID, code, errorServiceAvailable(prepareErr)); err != nil {
+					return errors.Join(prepareErr, err)
+				}
+				return fmt.Errorf("prepare recovery point: %w", prepareErr)
+			}
+			if err := validateBackupMetadataShape(recovery); err != nil {
+				validationErr := fmt.Errorf("prepared recovery point is invalid: %w", err)
+				if persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_invalid", true); persistErr != nil {
+					return errors.Join(validationErr, persistErr)
+				}
+				return validationErr
+			}
+			if recovery.JobID != job.ID || recovery.Version != job.CurrentVersion {
+				validationErr := fmt.Errorf("prepared recovery point does not match job")
+				if persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_invalid", true); persistErr != nil {
+					return errors.Join(validationErr, persistErr)
+				}
+				return validationErr
+			}
+			if !digestAllowed(recovery.ImageDigest, step.SourceImageDigests) {
+				validationErr := errUntrustedSourceImageDigest
+				persistErr := engine.updateJob(ctx, job.ID, func(job *Job, state *RuntimeState) {
+					job.RecoveryPoint = &recovery
+					job.Status = JobFailed
+					job.CurrentStep = JobStepComplete
+					job.ServiceAvailable = true
+					job.LastSafeVersion = job.CurrentVersion
+					job.ErrorCode = "source_image_digest_untrusted"
+					job.ErrorMessage = "The installed server image is not approved by the selected release path."
+					state.DesiredState = DesiredRunning
+				})
+				return errors.Join(validationErr, persistErr)
+			}
+			if err := engine.updateJob(ctx, job.ID, func(job *Job, state *RuntimeState) {
+				for priorID, prior := range state.Jobs {
+					if priorID != job.ID && !prior.Status.active() && prior.RecoveryPoint != nil {
+						prior.RecoveryPoint = nil
+						state.Jobs[priorID] = prior
+					}
+				}
+				job.RecoveryPoint = &recovery
+				job.Status = JobPulling
+				job.CompletedSteps = stepBase + 2
+				job.ServiceAvailable = true
+				job.CurrentStep = JobStepPulling
+			}); err != nil {
+				return err
 			}
 			job.RecoveryPoint = &recovery
 			job.Status = JobPulling
-			job.CompletedSteps = 2
+			job.CompletedSteps = stepBase + 2
 			job.ServiceAvailable = true
 			job.CurrentStep = JobStepPulling
-		}); err != nil {
-			return err
-		}
-		job.RecoveryPoint = &recovery
-		job.Status = JobPulling
-		job.CompletedSteps = 2
-		job.ServiceAvailable = true
-		job.CurrentStep = JobStepPulling
-		fallthrough
-	case JobPulling, JobStopping, JobMigrating, JobStarting:
-		if activateErr := engine.runtime.ActivateTarget(ctx, plan.Manifest, engine.progress(ctx, job.ID)); activateErr != nil {
-			if !errorMutationStarted(activateErr) {
-				persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "target_activation_failed", errorServiceAvailable(activateErr))
-				return errors.Join(fmt.Errorf("activate target before host mutation: %w", activateErr), persistErr)
+			fallthrough
+		case JobPulling, JobStopping, JobMigrating, JobStarting:
+			if activateErr := engine.runtime.ActivateTarget(ctx, step.Manifest, engine.progress(ctx, job.ID)); activateErr != nil {
+				if !errorMutationStarted(activateErr) {
+					persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "target_activation_failed", errorServiceAvailable(activateErr))
+					return errors.Join(fmt.Errorf("activate target before host mutation: %w", activateErr), persistErr)
+				}
+				return engine.beginAndRunRollback(ctx, job, "target_activation_failed", activateErr)
 			}
-			return engine.beginAndRunRollback(ctx, job, "target_activation_failed", activateErr)
-		}
-		if err := engine.updateJob(ctx, job.ID, func(job *Job, _ *RuntimeState) {
+			if err := engine.updateJob(ctx, job.ID, func(job *Job, _ *RuntimeState) {
+				job.Status = JobHealthCheck
+				job.CompletedSteps = stepBase + 6
+				job.ServiceAvailable = false
+				job.CurrentStep = JobStepCheckTarget
+			}); err != nil {
+				return err
+			}
 			job.Status = JobHealthCheck
-			job.CompletedSteps = 6
+			job.CompletedSteps = stepBase + 6
 			job.ServiceAvailable = false
 			job.CurrentStep = JobStepCheckTarget
-		}); err != nil {
-			return err
+			fallthrough
+		case JobHealthCheck:
+			if healthErr := engine.runtime.CheckTarget(ctx, step.Manifest); healthErr != nil {
+				return engine.beginAndRunRollback(ctx, job, "target_health_failed", healthErr)
+			}
+			finalHop := job.CurrentHop+1 == len(plan.ReleaseChain)
+			if err := engine.updateJob(ctx, job.ID, func(job *Job, state *RuntimeState) {
+				job.CurrentVersion = step.Manifest.Version
+				job.CurrentHop++
+				job.CompletedSteps = job.CurrentHop * executionTotalSteps
+				job.ServiceAvailable = true
+				job.LastSafeVersion = step.Manifest.Version
+				job.ErrorCode = ""
+				job.ErrorMessage = ""
+				if finalHop {
+					job.Status = JobSucceeded
+					job.CurrentStep = JobStepComplete
+					state.DesiredState = DesiredRunning
+					return
+				}
+				job.Status = JobValidating
+				job.CurrentStep = JobStepValidate
+			}); err != nil {
+				return err
+			}
+			if finalHop {
+				return nil
+			}
+			continue
+		default:
+			return fmt.Errorf("active job %s has unsupported status %q", job.ID, job.Status)
 		}
-		job.Status = JobHealthCheck
-		job.CompletedSteps = 6
-		job.ServiceAvailable = false
-		job.CurrentStep = JobStepCheckTarget
-		fallthrough
-	case JobHealthCheck:
-		if healthErr := engine.runtime.CheckTarget(ctx, plan.Manifest); healthErr != nil {
-			return engine.beginAndRunRollback(ctx, job, "target_health_failed", healthErr)
-		}
-		return engine.updateJob(ctx, job.ID, func(job *Job, state *RuntimeState) {
-			job.Status = JobSucceeded
-			job.CurrentStep = JobStepComplete
-			job.CompletedSteps = executionTotalSteps
-			job.ServiceAvailable = true
-			job.LastSafeVersion = job.TargetVersion
-			job.ErrorCode = ""
-			job.ErrorMessage = ""
-			state.DesiredState = DesiredRunning
-		})
-	default:
-		return fmt.Errorf("active job %s has unsupported status %q", job.ID, job.Status)
 	}
+}
+
+func digestAllowed(observed string, allowed []string) bool {
+	for _, digest := range allowed {
+		if observed == digest {
+			return true
+		}
+	}
+	return false
 }
 
 func (engine *JobEngine) progress(ctx context.Context, jobID string) func(JobStatus) error {
@@ -241,7 +302,7 @@ func (engine *JobEngine) progress(ctx context.Context, jobID string) func(JobSta
 			}
 			job.Status = next
 			job.CurrentStep = JobStep(next)
-			job.CompletedSteps = nextRank
+			job.CompletedSteps = job.CurrentHop*executionTotalSteps + nextRank
 			switch next {
 			case JobBackingUp, JobStopping, JobMigrating, JobStarting:
 				job.ServiceAvailable = false
@@ -317,9 +378,26 @@ func (engine *JobEngine) resumeRollback(ctx context.Context, job Job) error {
 		job.CurrentStep = JobStepComplete
 		job.ServiceAvailable = true
 		job.LastSafeVersion = job.RecoveryPoint.Version
+		job.CurrentVersion = job.RecoveryPoint.Version
+		if plan, ok := state.Plans[job.PlanTokenHash]; ok {
+			job.CurrentHop = completedHopForVersion(plan, job.CurrentVersion)
+			job.CompletedSteps = job.CurrentHop * executionTotalSteps
+		}
 		job.ErrorMessage = "The target release failed validation. The previous release was restored."
 		state.DesiredState = DesiredRunning
 	})
+}
+
+func completedHopForVersion(plan Plan, version string) int {
+	if version == plan.CurrentVersion {
+		return 0
+	}
+	for stepNumber, step := range plan.ReleaseChain {
+		if step.Manifest.Version == version {
+			return stepNumber + 1
+		}
+	}
+	return 0
 }
 
 func (engine *JobEngine) recordRecoveryFailure(ctx context.Context, job Job, cause error) error {

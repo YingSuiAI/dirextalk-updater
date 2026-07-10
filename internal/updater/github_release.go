@@ -16,13 +16,13 @@ import (
 
 const (
 	GitHubLatestReleaseAPI = "https://api.github.com/repos/YingSuiAI/dirextalk-message-server/releases/latest"
-	manifestAssetName      = "release-manifest.json"
-	checksumAssetName      = "release-manifest.json.sha256"
+	indexAssetName         = "release-index.json"
+	checksumAssetName      = "release-index.json.sha256"
 	maxReleaseMetadataSize = 1024 * 1024
 	maxReleaseAssetSize    = 1024 * 1024
 )
 
-var checksumPattern = regexp.MustCompile(`^([0-9a-f]{64})  release-manifest\.json\n?$`)
+var checksumPattern = regexp.MustCompile(`^([0-9a-f]{64})  release-index\.json\n$`)
 
 type ResolvedRelease struct {
 	Source         string `json:"source"`
@@ -31,7 +31,8 @@ type ResolvedRelease struct {
 	Digest         string `json:"digest"`
 	ImageRef       string `json:"image_ref"`
 	ManifestDigest string `json:"manifest_digest"`
-	manifestData   []byte
+	IndexDigest    string `json:"index_digest"`
+	indexData      []byte
 }
 
 type GitHubReleaseSource struct {
@@ -50,7 +51,7 @@ func (source *GitHubReleaseSource) Latest(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte(nil), resolved.manifestData...), nil
+	return append([]byte(nil), resolved.indexData...), nil
 }
 
 func (source *GitHubReleaseSource) Resolve(ctx context.Context) (ResolvedRelease, error) {
@@ -82,7 +83,7 @@ func (source *GitHubReleaseSource) Resolve(ctx context.Context) (ResolvedRelease
 	}
 	assetURLs := map[string]string{}
 	for _, asset := range metadata.Assets {
-		if asset.Name != manifestAssetName && asset.Name != checksumAssetName {
+		if asset.Name != indexAssetName && asset.Name != checksumAssetName {
 			continue
 		}
 		if assetURLs[asset.Name] != "" {
@@ -93,43 +94,45 @@ func (source *GitHubReleaseSource) Resolve(ctx context.Context) (ResolvedRelease
 		}
 		assetURLs[asset.Name] = asset.URL
 	}
-	manifestURL := assetURLs[manifestAssetName]
+	indexURL := assetURLs[indexAssetName]
 	checksumURL := assetURLs[checksumAssetName]
-	if manifestURL == "" || checksumURL == "" {
-		return ResolvedRelease{}, fmt.Errorf("formal release requires %s and %s assets", manifestAssetName, checksumAssetName)
+	if indexURL == "" || checksumURL == "" {
+		return ResolvedRelease{}, fmt.Errorf("formal release requires %s and %s assets", indexAssetName, checksumAssetName)
 	}
-	manifestData, err := source.get(ctx, manifestURL, maxReleaseAssetSize)
+	indexData, err := source.get(ctx, indexURL, maxReleaseAssetSize)
 	if err != nil {
-		return ResolvedRelease{}, fmt.Errorf("fetch release manifest: %w", err)
+		return ResolvedRelease{}, fmt.Errorf("fetch release index: %w", err)
 	}
 	checksumData, err := source.get(ctx, checksumURL, maxReleaseAssetSize)
 	if err != nil {
-		return ResolvedRelease{}, fmt.Errorf("fetch release manifest checksum: %w", err)
+		return ResolvedRelease{}, fmt.Errorf("fetch release index checksum: %w", err)
 	}
 	checksumMatch := checksumPattern.FindStringSubmatch(string(checksumData))
 	if checksumMatch == nil {
-		return ResolvedRelease{}, fmt.Errorf("release manifest checksum has invalid format")
+		return ResolvedRelease{}, fmt.Errorf("release index checksum has invalid format")
 	}
-	manifestHash := sha256.Sum256(manifestData)
-	manifestHashHex := hex.EncodeToString(manifestHash[:])
-	if checksumMatch[1] != manifestHashHex {
-		return ResolvedRelease{}, fmt.Errorf("release manifest checksum mismatch")
+	indexHash := sha256.Sum256(indexData)
+	indexHashHex := hex.EncodeToString(indexHash[:])
+	if checksumMatch[1] != indexHashHex {
+		return ResolvedRelease{}, fmt.Errorf("release index checksum mismatch")
 	}
-	manifest, err := ValidateManifest(manifestData)
+	index, err := ValidateReleaseIndex(indexData)
 	if err != nil {
 		return ResolvedRelease{}, err
 	}
-	if manifest.Version != metadata.TagName {
-		return ResolvedRelease{}, fmt.Errorf("release tag %s does not match manifest version %s", metadata.TagName, manifest.Version)
+	if index.LatestVersion != metadata.TagName {
+		return ResolvedRelease{}, fmt.Errorf("release tag %s does not match index latest_version %s", metadata.TagName, index.LatestVersion)
 	}
+	latest := index.Releases[len(index.Releases)-1]
 	return ResolvedRelease{
 		Source:         "github_release",
-		Version:        manifest.Version,
-		Image:          manifest.Image,
-		Digest:         manifest.ImageDigest,
-		ImageRef:       manifest.Image + "@" + manifest.ImageDigest,
-		ManifestDigest: "sha256:" + manifestHashHex,
-		manifestData:   append([]byte(nil), manifestData...),
+		Version:        latest.Manifest.Version,
+		Image:          latest.Manifest.Image,
+		Digest:         latest.Manifest.ImageDigest,
+		ImageRef:       latest.Manifest.Image + "@" + latest.Manifest.ImageDigest,
+		ManifestDigest: latest.ManifestDigest,
+		IndexDigest:    "sha256:" + indexHashHex,
+		indexData:      append([]byte(nil), indexData...),
 	}, nil
 }
 

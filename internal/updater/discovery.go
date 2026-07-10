@@ -42,13 +42,13 @@ func RefreshDiscovery(ctx context.Context, store *StateStore, source ReleaseSour
 		}
 		return cache, fmt.Errorf("discover latest release: %w", sourceErr)
 	}
-	manifest, validationErr := ValidateManifest(data)
+	index, validationErr := ValidateReleaseIndex(data)
 	if validationErr != nil {
 		var cache DiscoveryCache
 		if saveErr := store.Update(ctx, func(state *RuntimeState) error {
 			cache = state.Discovery
 			cache.CheckedAt = checkedAt.UTC()
-			cache.ErrorCode = "release_manifest_invalid"
+			cache.ErrorCode = "release_index_invalid"
 			if cache.Manifest == nil {
 				cache.Status = DiscoveryUnavailable
 			} else {
@@ -64,8 +64,10 @@ func RefreshDiscovery(ctx context.Context, store *StateStore, source ReleaseSour
 	cache := DiscoveryCache{
 		Status:         DiscoveryFresh,
 		CheckedAt:      checkedAt.UTC(),
-		Manifest:       &manifest,
-		ManifestDigest: manifestDigest(data),
+		Manifest:       &index.Releases[len(index.Releases)-1].Manifest,
+		ManifestDigest: index.Releases[len(index.Releases)-1].ManifestDigest,
+		Index:          &index,
+		IndexDigest:    releaseIndexDigest(data),
 	}
 	if err := store.Update(ctx, func(state *RuntimeState) error {
 		state.Discovery = cache

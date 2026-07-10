@@ -203,6 +203,8 @@ func TestIdempotentJobReplayDoesNotCancelInFlightWatchdogRepair(t *testing.T) {
 		job.Status = JobSucceeded
 		job.CurrentStep = JobStepComplete
 		job.CompletedSteps = executionTotalSteps
+		job.CurrentHop = job.TotalHops
+		job.CurrentVersion = job.TargetVersion
 		job.ServiceAvailable = true
 		job.LastSafeVersion = job.TargetVersion
 		state.Jobs[job.ID] = job

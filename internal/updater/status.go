@@ -203,26 +203,49 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 		return status, nil
 	}
 	compatible := true
+	var releaseChain []ReleaseStep
 	if status.UpdateAvailable {
-		if err := manifest.ValidateUpgradeFrom(input.CurrentVersion); err != nil {
+		if state.Discovery.Index == nil {
 			compatible = false
 			status.Reasons = append(status.Reasons, "upgrade_path_unsupported")
+		} else {
+			releaseChain, _ = state.Discovery.Index.UpgradePath(input.CurrentVersion)
+			if len(releaseChain) == 0 {
+				compatible = false
+				status.Reasons = append(status.Reasons, "upgrade_path_unsupported")
+			}
 		}
 	}
-	if input.CurrentSchemaVersion < manifest.SchemaCompatVersion || input.CurrentSchemaCompatVersion > manifest.SchemaVersion {
-		compatible = false
-		status.Reasons = append(status.Reasons, "schema_incompatible")
+	currentSchema := input.CurrentSchemaVersion
+	currentSchemaCompat := input.CurrentSchemaCompatVersion
+	compatibilitySteps := releaseChain
+	if !status.UpdateAvailable {
+		compatibilitySteps = []ReleaseStep{{Manifest: *manifest}}
+	}
+	for _, step := range compatibilitySteps {
+		if currentSchema < step.Manifest.SchemaCompatVersion || currentSchemaCompat > step.Manifest.SchemaVersion {
+			compatible = false
+			status.Reasons = append(status.Reasons, "schema_incompatible")
+			break
+		}
+		currentSchema = step.Manifest.SchemaVersion
+		currentSchemaCompat = step.Manifest.SchemaCompatVersion
 	}
 	client, _ := parseCanonicalVersion("client_version", input.ClientVersion)
-	minimum, _ := parseCanonicalVersion("minimum_client_version", manifest.MinimumClientVersion)
-	maximum, _ := parseCanonicalVersion("maximum_client_version_exclusive", manifest.MaximumClientVersionExclusive)
-	if client.LessThan(minimum) {
-		compatible = false
-		status.Reasons = append(status.Reasons, "client_too_old")
-	}
-	if !client.LessThan(maximum) {
-		compatible = false
-		status.Reasons = append(status.Reasons, "client_too_new")
+	clientSteps := compatibilitySteps
+	for _, step := range clientSteps {
+		minimum, _ := parseCanonicalVersion("minimum_client_version", step.Manifest.MinimumClientVersion)
+		maximum, _ := parseCanonicalVersion("maximum_client_version_exclusive", step.Manifest.MaximumClientVersionExclusive)
+		if client.LessThan(minimum) {
+			compatible = false
+			status.Reasons = append(status.Reasons, "client_too_old")
+			break
+		}
+		if !client.LessThan(maximum) {
+			compatible = false
+			status.Reasons = append(status.Reasons, "client_too_new")
+			break
+		}
 	}
 	if !compatible {
 		status.Compatibility = CompatibilityIncompatible
@@ -248,6 +271,7 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 		Manifest:       *manifest,
 		ManifestDigest: state.Discovery.ManifestDigest,
 		CurrentVersion: input.CurrentVersion,
+		ReleaseChain:   releaseChain,
 		ExpiresAt:      now.Add(statusPlanLifetime),
 	}
 }
