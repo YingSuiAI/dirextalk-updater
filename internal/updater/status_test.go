@@ -151,7 +151,7 @@ func TestControlStatusCompatibilityAndDiscoveryStates(t *testing.T) {
 }
 
 func TestControlStatusDoesNotOfferOperationWhenDesiredStateIsNotRunning(t *testing.T) {
-	for _, desired := range []DesiredState{DesiredUpgrading, DesiredMaintenance, DesiredDeprovisioned} {
+	for _, desired := range []DesiredState{DesiredMaintenance, DesiredDeprovisioned} {
 		t.Run(string(desired), func(t *testing.T) {
 			service, store, _ := newStatusTestService(t, DiscoveryFresh)
 			state, err := store.Load(context.Background())
@@ -173,7 +173,7 @@ func TestControlStatusDoesNotOfferOperationWhenDesiredStateIsNotRunning(t *testi
 }
 
 func TestControlStatusDoesNotOfferOperationWhileAJobIsActive(t *testing.T) {
-	service, store, _ := newStatusTestService(t, DiscoveryFresh)
+	service, _, _ := newStatusTestService(t, DiscoveryFresh)
 	initial := postJSON(t, service.Handler(), controlStatusPath, compatibleStatusRequest, testControlToken, "")
 	var initialStatus StatusResponse
 	decodeResponse(t, initial, &initialStatus)
@@ -182,19 +182,47 @@ func TestControlStatusDoesNotOfferOperationWhileAJobIsActive(t *testing.T) {
 	if apply.Code != http.StatusAccepted {
 		t.Fatalf("create active job: %d %s", apply.Code, apply.Body.String())
 	}
-	state, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	state.DesiredState = DesiredRunning
-	if err := store.Save(context.Background(), state); err != nil {
-		t.Fatal(err)
-	}
 	response := postJSON(t, service.Handler(), controlStatusPath, compatibleStatusRequest, testControlToken, "")
 	var got StatusResponse
 	decodeResponse(t, response, &got)
-	if got.Compatibility != CompatibilityCompatible || len(got.Operations) != 0 || !containsReason(got.Reasons, "operation_in_progress") {
+	if got.Compatibility != CompatibilityCompatible || len(got.Operations) != 0 || !containsReason(got.Reasons, "operation_in_progress") || !containsReason(got.Reasons, "desired_state_not_running") {
 		t.Fatalf("active job did not gate operation: %#v", got)
+	}
+}
+
+func TestControlStatusExpiresFreshDiscoveryAtFrozenBoundary(t *testing.T) {
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name          string
+		age           time.Duration
+		wantDiscovery DiscoveryStatus
+		wantOperation bool
+	}{
+		{"exact boundary", DiscoveryMaximumAge, DiscoveryFresh, true},
+		{"past boundary", DiscoveryMaximumAge + time.Nanosecond, DiscoveryStale, false},
+		{"future timestamp", -time.Nanosecond, DiscoveryStale, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, _ := newStatusTestService(t, DiscoveryFresh)
+			state, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			state.Discovery.CheckedAt = now.Add(-test.age)
+			if err := store.Save(context.Background(), state); err != nil {
+				t.Fatal(err)
+			}
+			service.now = func() time.Time { return now }
+			response := postJSON(t, service.Handler(), controlStatusPath, compatibleStatusRequest, testControlToken, "")
+			var got StatusResponse
+			decodeResponse(t, response, &got)
+			if got.DiscoveryStatus != test.wantDiscovery || (len(got.Operations) == 1) != test.wantOperation {
+				t.Fatalf("unexpected freshness result: %#v", got)
+			}
+			if !test.wantOperation && !containsReason(got.Reasons, "discovery_stale") {
+				t.Fatalf("expired discovery did not fail closed: %#v", got)
+			}
+		})
 	}
 }
 

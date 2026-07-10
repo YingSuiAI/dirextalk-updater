@@ -86,8 +86,14 @@ func (service *Service) RegisterPlan(ctx context.Context, rawToken string, plan 
 		return fmt.Errorf("plan expiry must be in the future")
 	}
 	return service.store.Update(ctx, func(state *RuntimeState) error {
-		if state.Discovery.Status != DiscoveryFresh || state.Discovery.Manifest == nil {
+		if effectiveDiscoveryStatus(state.Discovery, service.now()) != DiscoveryFresh || state.Discovery.Manifest == nil {
 			return fmt.Errorf("a fresh discovered release is required")
+		}
+		if state.DesiredState != DesiredRunning {
+			return fmt.Errorf("desired state must be running to register a plan")
+		}
+		if hasActiveJob(*state) {
+			return fmt.Errorf("an operation is already in progress")
 		}
 		if state.Discovery.ManifestDigest != plan.ManifestDigest || !reflect.DeepEqual(*state.Discovery.Manifest, plan.Manifest) {
 			return fmt.Errorf("plan manifest does not match the discovered release")
@@ -147,7 +153,7 @@ func (service *Service) serveHTTP(response http.ResponseWriter, request *http.Re
 }
 
 func (service *Service) refreshDiscovery(response http.ResponseWriter, request *http.Request) {
-	if !constantTokenEqual(service.controlTokenHash, request.Header.Get(controlTokenHeader)) {
+	if !service.controlAuthorized(request) {
 		writeAPIError(response, http.StatusUnauthorized, "control_token_required")
 		return
 	}
@@ -156,14 +162,8 @@ func (service *Service) refreshDiscovery(response http.ResponseWriter, request *
 		return
 	}
 	var input struct{}
-	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, maxRequestBytes))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&input); err != nil {
-		writeAPIError(response, http.StatusBadRequest, "invalid_request")
-		return
-	}
-	if err := ensureJSONEOF(decoder, "discovery request"); err != nil {
-		writeAPIError(response, http.StatusBadRequest, "invalid_request")
+	if err := decodeControlRequest(response, request, &input, "discovery request"); err != nil {
+		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
 		return
 	}
 	cache, err := RefreshDiscovery(request.Context(), service.store, service.releaseSource, service.now())
@@ -197,18 +197,12 @@ type publicJob struct {
 }
 
 func (service *Service) createJob(response http.ResponseWriter, request *http.Request) {
-	if !constantTokenEqual(service.controlTokenHash, request.Header.Get(controlTokenHeader)) {
+	if !service.controlAuthorized(request) {
 		writeAPIError(response, http.StatusUnauthorized, "control_token_required")
 		return
 	}
 	var input createJobRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, maxRequestBytes))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&input); err != nil {
-		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
-		return
-	}
-	if err := ensureJSONEOF(decoder, "job request"); err != nil {
+	if err := decodeControlRequest(response, request, &input, "job request"); err != nil {
 		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
 		return
 	}
@@ -288,6 +282,19 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		return
 	}
 	writeJSON(response, http.StatusAccepted, ticket)
+}
+
+func (service *Service) controlAuthorized(request *http.Request) bool {
+	return constantTokenEqual(service.controlTokenHash, request.Header.Get(controlTokenHeader))
+}
+
+func decodeControlRequest(response http.ResponseWriter, request *http.Request, target any, subject string) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, maxRequestBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	return ensureJSONEOF(decoder, subject)
 }
 
 func (service *Service) getJob(response http.ResponseWriter, request *http.Request, jobID string) {

@@ -36,7 +36,7 @@ func TestControlDesiredStatePersistsEveryKnownValueAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, desired := range []DesiredState{DesiredRunning, DesiredUpgrading, DesiredMaintenance, DesiredDeprovisioned} {
+	for _, desired := range []DesiredState{DesiredRunning, DesiredMaintenance, DesiredDeprovisioned} {
 		response := postJSON(t, service.Handler(), controlDesiredStatePath, `{"desired_state":"`+string(desired)+`"}`, testControlToken, "")
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"desired_state":"`+string(desired)+`"`) {
 			t.Fatalf("persist %s: %d %s", desired, response.Code, response.Body.String())
@@ -53,5 +53,31 @@ func TestControlDesiredStatePersistsEveryKnownValueAcrossRestart(t *testing.T) {
 			t.Fatalf("restart lost desired state: got %s want %s", state.DesiredState, desired)
 		}
 		service = restarted
+	}
+}
+
+func TestControlDesiredStateReservesUpgradingForJobLifecycle(t *testing.T) {
+	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
+	service, err := NewService(store, testControlToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := postJSON(t, service.Handler(), controlDesiredStatePath, `{"desired_state":"upgrading"}`, testControlToken, "")
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "desired_state_reserved") {
+		t.Fatalf("external upgrading transition was not rejected: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestControlDesiredStateRejectsEveryOverrideDuringActiveJob(t *testing.T) {
+	service, _ := newTestService(t)
+	apply := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"active-job","confirm":"apply_release_change"}`, testControlToken, "")
+	if apply.Code != http.StatusAccepted {
+		t.Fatalf("create active job: %d %s", apply.Code, apply.Body.String())
+	}
+	for _, desired := range []DesiredState{DesiredRunning, DesiredUpgrading, DesiredMaintenance, DesiredDeprovisioned} {
+		response := postJSON(t, service.Handler(), controlDesiredStatePath, `{"desired_state":"`+string(desired)+`"}`, testControlToken, "")
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "operation_in_progress") {
+			t.Fatalf("active job allowed %s override: %d %s", desired, response.Code, response.Body.String())
+		}
 	}
 }

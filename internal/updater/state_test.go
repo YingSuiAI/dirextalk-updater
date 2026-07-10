@@ -58,6 +58,27 @@ func TestRuntimeStateRejectsUnknownFieldsAndInvalidDesiredState(t *testing.T) {
 	}
 }
 
+func TestRuntimeStateRejectsFreshDiscoveryWithoutCheckedAt(t *testing.T) {
+	manifestData := []byte(validManifestJSON())
+	manifest, err := ValidateManifest(manifestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := NewRuntimeState()
+	state.Discovery = DiscoveryCache{Status: DiscoveryFresh, Manifest: &manifest, ManifestDigest: manifestDigest(manifestData)}
+	if err := NewStateStore(filepath.Join(t.TempDir(), "state.json")).Save(context.Background(), state); err == nil {
+		t.Fatal("fresh discovery without checked_at was accepted")
+	}
+}
+
+func TestRuntimeStateRejectsInvalidUpgradingAndActiveJobCombinations(t *testing.T) {
+	state := NewRuntimeState()
+	state.DesiredState = DesiredUpgrading
+	if err := NewStateStore(filepath.Join(t.TempDir(), "state.json")).Save(context.Background(), state); err == nil {
+		t.Fatal("upgrading without an active job was accepted")
+	}
+}
+
 func TestRuntimeStateRejectsInvalidPersistedPlanAndJobState(t *testing.T) {
 	manifest, err := ValidateManifest([]byte(validManifestJSON()))
 	if err != nil {

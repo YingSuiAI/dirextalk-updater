@@ -1,7 +1,6 @@
 package updater
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -56,18 +55,12 @@ type StatusResponse struct {
 }
 
 func (service *Service) getStatus(response http.ResponseWriter, request *http.Request) {
-	if !constantTokenEqual(service.controlTokenHash, request.Header.Get(controlTokenHeader)) {
+	if !service.controlAuthorized(request) {
 		writeAPIError(response, http.StatusUnauthorized, "control_token_required")
 		return
 	}
 	var input statusRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, maxRequestBytes))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&input); err != nil {
-		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
-		return
-	}
-	if err := ensureJSONEOF(decoder, "status request"); err != nil {
+	if err := decodeControlRequest(response, request, &input, "status request"); err != nil {
 		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
 		return
 	}
@@ -158,9 +151,10 @@ func normalizeClientVersion(value string) (string, error) {
 }
 
 func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.Time) (StatusResponse, *Plan) {
+	discoveryStatus := effectiveDiscoveryStatus(state.Discovery, now)
 	status := StatusResponse{
 		Available:       true,
-		DiscoveryStatus: state.Discovery.Status,
+		DiscoveryStatus: discoveryStatus,
 		CurrentVersion:  input.CurrentVersion,
 		ClientVersion:   input.ClientVersion,
 		Compatibility:   CompatibilityUnknown,
@@ -172,8 +166,8 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 		status.CheckedAt = &checkedAt
 	}
 	manifest := state.Discovery.Manifest
-	if manifest == nil || (state.Discovery.Status != DiscoveryFresh && state.Discovery.Status != DiscoveryStale) {
-		status.Reasons = append(status.Reasons, discoveryReason(state.Discovery.Status))
+	if manifest == nil || (discoveryStatus != DiscoveryFresh && discoveryStatus != DiscoveryStale) {
+		status.Reasons = append(status.Reasons, discoveryReason(discoveryStatus))
 		return status, nil
 	}
 	status.ReleaseAvailable = true
@@ -182,7 +176,7 @@ func evaluateStatus(state RuntimeState, input normalizedStatusRequest, now time.
 	current, _ := parseCanonicalVersion("current_version", input.CurrentVersion)
 	latest, _ := parseCanonicalVersion("latest_version", manifest.Version)
 	status.UpdateAvailable = current.LessThan(latest)
-	if state.Discovery.Status == DiscoveryStale {
+	if discoveryStatus == DiscoveryStale {
 		status.Reasons = append(status.Reasons, "discovery_stale")
 		return status, nil
 	}

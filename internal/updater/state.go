@@ -129,6 +129,9 @@ func (state *RuntimeState) normalizeAndValidate() error {
 	} else if state.Discovery.Status == DiscoveryFresh {
 		return fmt.Errorf("fresh discovery requires a manifest")
 	}
+	if state.Discovery.Status == DiscoveryFresh && state.Discovery.CheckedAt.IsZero() {
+		return fmt.Errorf("fresh discovery requires checked_at")
+	}
 	for planHash, plan := range state.Plans {
 		if !storedTokenHashValid(planHash) {
 			return fmt.Errorf("plan token hash is invalid")
@@ -177,6 +180,13 @@ func (state *RuntimeState) normalizeAndValidate() error {
 		if idempotencyKey == "" || !ok || job.IdempotencyKey != idempotencyKey {
 			return fmt.Errorf("idempotency mapping is invalid")
 		}
+	}
+	activeJob := hasActiveJob(*state)
+	if state.DesiredState == DesiredUpgrading && !activeJob {
+		return fmt.Errorf("desired_state upgrading requires an active job")
+	}
+	if activeJob && state.DesiredState != DesiredUpgrading {
+		return fmt.Errorf("an active job requires desired_state upgrading")
 	}
 	return nil
 }
@@ -250,6 +260,9 @@ func migrateRuntimeState(state *RuntimeState) error {
 				job.ManifestDigest = plan.ManifestDigest
 			}
 			state.Jobs[jobID] = job
+		}
+		if hasActiveJob(*state) {
+			state.DesiredState = DesiredUpgrading
 		}
 		state.SchemaVersion = RuntimeStateSchemaVersion
 		return nil

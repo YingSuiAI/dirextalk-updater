@@ -159,7 +159,7 @@ func TestFirstJobTransitionsDesiredStateAndBlocksDifferentKey(t *testing.T) {
 }
 
 func TestNewJobIsRejectedForEveryNonRunningDesiredState(t *testing.T) {
-	for _, desired := range []DesiredState{DesiredUpgrading, DesiredMaintenance, DesiredDeprovisioned} {
+	for _, desired := range []DesiredState{DesiredMaintenance, DesiredDeprovisioned} {
 		t.Run(string(desired), func(t *testing.T) {
 			service, store := newTestService(t)
 			state, err := store.Load(context.Background())
@@ -249,10 +249,6 @@ func TestIdempotentReplaySucceedsAfterPlanExpiryButDifferentKeyFails(t *testing.
 
 func TestIdempotencyKeyCannotBeReusedForDifferentPlan(t *testing.T) {
 	service, store := newTestService(t)
-	first := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")
-	if first.Code != http.StatusAccepted {
-		t.Fatalf("create first job: %d %s", first.Code, first.Body.String())
-	}
 	manifest, err := ValidateManifest([]byte(validManifestJSON()))
 	if err != nil {
 		t.Fatal(err)
@@ -263,6 +259,10 @@ func TestIdempotencyKeyCannotBeReusedForDifferentPlan(t *testing.T) {
 	}
 	if err := service.RegisterPlan(context.Background(), "other-plan", Plan{Manifest: manifest, ManifestDigest: state.Discovery.ManifestDigest, CurrentVersion: "v1.0.0", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
+	}
+	first := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("create first job: %d %s", first.Code, first.Body.String())
 	}
 	conflict := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"other-plan","idempotency_key":"request-1","confirm":"apply_release_change"}`, testControlToken, "")
 	if conflict.Code != http.StatusConflict {
@@ -330,6 +330,33 @@ func TestRegisterPlanRejectsUnsupportedEdgeAndTokenRebinding(t *testing.T) {
 	}
 	if err := service.RegisterPlan(context.Background(), testPlanToken, rebound); err == nil {
 		t.Fatal("expected an existing plan token to be immutable")
+	}
+}
+
+func TestRegisterPlanAtomicallyRechecksFreshnessAndEligibility(t *testing.T) {
+	service, store := newTestService(t)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkedAt := state.Discovery.CheckedAt
+	plan := Plan{Manifest: *state.Discovery.Manifest, ManifestDigest: state.Discovery.ManifestDigest, CurrentVersion: "v1.0.0", ExpiresAt: checkedAt.Add(48 * time.Hour)}
+	service.now = func() time.Time { return checkedAt.Add(DiscoveryMaximumAge + time.Nanosecond) }
+	if err := service.RegisterPlan(context.Background(), "expired-discovery", plan); err == nil || !strings.Contains(err.Error(), "fresh discovered release") {
+		t.Fatalf("expired discovery registered a plan: %v", err)
+	}
+
+	service.now = func() time.Time { return checkedAt.Add(time.Hour) }
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.DesiredState = DesiredMaintenance
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RegisterPlan(context.Background(), "maintenance-plan", plan); err == nil || !strings.Contains(err.Error(), "desired state") {
+		t.Fatalf("maintenance registered a plan: %v", err)
 	}
 }
 

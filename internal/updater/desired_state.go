@@ -1,7 +1,7 @@
 package updater
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
 )
 
@@ -14,18 +14,12 @@ type desiredStateResponse struct {
 }
 
 func (service *Service) setDesiredState(response http.ResponseWriter, request *http.Request) {
-	if !constantTokenEqual(service.controlTokenHash, request.Header.Get(controlTokenHeader)) {
+	if !service.controlAuthorized(request) {
 		writeAPIError(response, http.StatusUnauthorized, "control_token_required")
 		return
 	}
 	var input desiredStateRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, maxRequestBytes))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&input); err != nil {
-		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
-		return
-	}
-	if err := ensureJSONEOF(decoder, "desired-state request"); err != nil {
+	if err := decodeControlRequest(response, request, &input, "desired-state request"); err != nil {
 		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
 		return
 	}
@@ -33,11 +27,22 @@ func (service *Service) setDesiredState(response http.ResponseWriter, request *h
 		writeAPIError(response, http.StatusBadRequest, "invalid_request")
 		return
 	}
+	var rejection *mutationRejection
 	if err := service.store.Update(request.Context(), func(state *RuntimeState) error {
+		if hasActiveJob(*state) {
+			return rejectMutation(http.StatusConflict, "operation_in_progress")
+		}
+		if input.DesiredState == DesiredUpgrading {
+			return rejectMutation(http.StatusConflict, "desired_state_reserved")
+		}
 		state.DesiredState = input.DesiredState
 		return nil
 	}); err != nil {
-		writeAPIError(response, http.StatusInternalServerError, "state_write_failed")
+		if errors.As(err, &rejection) {
+			writeAPIError(response, rejection.status, rejection.code)
+		} else {
+			writeAPIError(response, http.StatusInternalServerError, "state_write_failed")
+		}
 		return
 	}
 	writeJSON(response, http.StatusOK, desiredStateResponse{DesiredState: input.DesiredState})

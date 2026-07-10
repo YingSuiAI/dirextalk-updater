@@ -6,6 +6,18 @@ import (
 	"time"
 )
 
+const DiscoveryMaximumAge = 36 * time.Hour
+
+func effectiveDiscoveryStatus(cache DiscoveryCache, now time.Time) DiscoveryStatus {
+	if cache.Status != DiscoveryFresh {
+		return cache.Status
+	}
+	if cache.CheckedAt.IsZero() || now.Before(cache.CheckedAt) || now.Sub(cache.CheckedAt) > DiscoveryMaximumAge {
+		return DiscoveryStale
+	}
+	return DiscoveryFresh
+}
+
 type ReleaseSource interface {
 	Latest(context.Context) ([]byte, error)
 }

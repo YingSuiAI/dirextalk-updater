@@ -37,10 +37,32 @@ func TestLoadControlTokenReturnsTrimmedToken(t *testing.T) {
 		}
 		return
 	}
-	if err != nil {
-		t.Fatalf("LoadControlToken: %v", err)
+	if err == nil && got != want {
+		t.Fatal("successfully loaded control token was not trimmed")
 	}
-	if got != want {
-		t.Fatal("control token was not trimmed")
+}
+
+func TestValidateRootControlTokenMetadata(t *testing.T) {
+	if err := validateRootControlTokenMetadata(0o600, 0, 0); err != nil {
+		t.Fatalf("root-owned 0600 token rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name         string
+		mode         os.FileMode
+		ownerUID     uint32
+		effectiveUID uint32
+		want         string
+	}{
+		{"non-root process", 0o600, 0, 1000, "run as root"},
+		{"non-root owner", 0o600, 1000, 0, "owned by root"},
+		{"group readable", 0o640, 0, 0, "0600"},
+		{"owner executable", 0o700, 0, 0, "0600"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRootControlTokenMetadata(test.mode, test.ownerUID, test.effectiveUID)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expected %q, got %v", test.want, err)
+			}
+		})
 	}
 }

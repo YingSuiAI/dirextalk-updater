@@ -18,18 +18,25 @@ the application is down.
 ## Safety Contract
 
 - Keep the control API on its Unix socket. Do not add a TCP listener.
-- Treat the root-owned control token and per-job bearer tokens as secrets.
+- The daemon is a root host-operation boundary. Require EUID 0 and a
+  root-owned control-token regular file with mode exactly `0600`.
+- Treat the control token and per-job bearer tokens as secrets.
   Persist hashes only and never print raw tokens in logs or errors.
 - Keep request bodies declarative. Callers must not provide shell commands,
   Compose paths, service names, image repositories, or digests.
 - Preserve the fixed Compose project, file, image repository, and service
   allowlist in code-owned configuration.
 - Persist state atomically and durably. A new job and the transition to
-  `upgrading` are one transaction; only one active job is allowed.
+  `upgrading` are one transaction; only one active job is allowed. External
+  desired-state calls cannot select `upgrading` or overwrite any state while a
+  job is active.
 - Same-key idempotent replay must recover an already committed job even after
   its plan expires. A new key must never reuse an expired plan.
 - A fresh discovered and validated server Release manifest is required before
-  issuing a plan. Client, schema, and upgrade-edge compatibility fail closed.
+  issuing a plan. Freshness expires after the frozen 36-hour window; future or
+  missing check times fail closed. Client, schema, and upgrade-edge
+  compatibility also fail closed. Plan registration atomically rechecks
+  discovery freshness and host eligibility before returning an operation.
 
 ## Change Workflow
 
@@ -44,8 +51,11 @@ the application is down.
 ## Release Contract
 
 - Stable tags are canonical `vX.Y.Z` tags.
-- Formal binaries must inject version, full commit, and RFC3339 UTC build time
-  through linker flags; local builds remain `v0.0.0-dev+local`.
+- Formal binaries use exactly Go 1.24.13 and must inject version, full commit,
+  and the tagged commit's RFC3339 UTC timestamp through linker flags; local
+  builds remain `v0.0.0-dev+local`.
+- The release builder uses two independent Go caches and requires byte-for-byte
+  identical binaries before creating assets.
 - Publish exactly `dirextalk-updater-linux-amd64`, its `.sha256` file, and
   `dirextalk-updater-release.json` from the tag workflow.
 - Do not create a repository, remote, tag, GitHub Release, or upload assets
