@@ -62,7 +62,11 @@ func (job Job) validateExecutionState() error {
 		return fmt.Errorf("recovery attempts are invalid")
 	}
 	if job.Status.active() {
-		if job.TotalHops < 1 || job.CurrentHop < 0 || job.CurrentHop >= job.TotalHops || job.TotalSteps != executionTotalSteps*job.TotalHops {
+		hopInRange := job.CurrentHop >= 0 && job.CurrentHop < job.TotalHops
+		if job.Status == JobRollingBack || job.Status == JobRestarting {
+			hopInRange = job.CurrentHop >= 0 && job.CurrentHop <= job.TotalHops
+		}
+		if job.TotalHops < 1 || !hopInRange || job.TotalSteps != executionTotalSteps*job.TotalHops {
 			return fmt.Errorf("active job hop progress is invalid")
 		}
 		if job.CurrentStep == "" {

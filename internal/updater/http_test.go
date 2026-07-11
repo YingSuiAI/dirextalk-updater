@@ -189,6 +189,42 @@ func TestPublicRollbackOperationRequiresCommittedRecoveryMetadata(t *testing.T) 
 	}
 }
 
+func TestSuccessfulJobCanQueueCommittedRollback(t *testing.T) {
+	service, store := newTestService(t)
+	created := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"successful-rollback","confirm":"apply_release_change"}`, testControlToken, "")
+	var ticket JobTicket
+	decodeResponse(t, created, &ticket)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := state.Jobs[ticket.JobID]
+	recovery, err := (&fakeUpgradeRuntime{}).PrepareBackup(context.Background(), job, state.Plans[job.PlanTokenHash], ignoreProgress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		job := state.Jobs[ticket.JobID]
+		job.Status = JobSucceeded
+		job.CurrentStep = JobStepComplete
+		job.CompletedSteps = job.TotalSteps
+		job.CurrentHop = job.TotalHops
+		job.CurrentVersion = job.TargetVersion
+		job.ServiceAvailable = true
+		job.LastSafeVersion = job.TargetVersion
+		job.RecoveryPoint = &recovery
+		state.Jobs[job.ID] = job
+		state.DesiredState = DesiredRunning
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rollback := postJSON(t, service.Handler(), publicJobPath(ticket.JobID)+"/rollback", `{}`, "", ticket.JobToken)
+	if rollback.Code != http.StatusAccepted {
+		t.Fatalf("successful job rollback status=%d body=%s", rollback.Code, rollback.Body.String())
+	}
+}
+
 func TestNewJobRevokesOlderTerminalRollbackAuthority(t *testing.T) {
 	service, store := newTestService(t)
 	firstResponse := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"first-edge","confirm":"apply_release_change"}`, testControlToken, "")
