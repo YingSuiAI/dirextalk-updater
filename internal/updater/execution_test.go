@@ -224,6 +224,41 @@ func TestJobEnginePersistsRollbackCheckpointAndResumesAfterRestart(t *testing.T)
 	}
 }
 
+func TestJobEngineCompletesManualRollbackWithoutInventingAnError(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedExecutionJob(t)
+	engine := NewJobEngine(store, &fakeUpgradeRuntime{})
+	if err := engine.RunActive(context.Background()); err != nil {
+		t.Fatalf("complete upgrade: %v", err)
+	}
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		job := state.Jobs[jobID]
+		job.Status = JobRollingBack
+		job.CurrentStep = JobStepRestoreBackup
+		job.ServiceAvailable = false
+		state.Jobs[jobID] = job
+		state.DesiredState = DesiredUpgrading
+		return nil
+	}); err != nil {
+		t.Fatalf("start manual rollback: %v", err)
+	}
+
+	if err := engine.RunActive(context.Background()); err != nil {
+		t.Fatalf("complete manual rollback: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := state.Jobs[jobID]
+	if job.Status != JobRolledBack || job.CurrentVersion != "v1.0.0" || !job.ServiceAvailable {
+		t.Fatalf("unexpected manual rollback result: %#v", job)
+	}
+	if job.ErrorCode != "" || job.ErrorMessage != "" {
+		t.Fatalf("successful manual rollback invented an error: %#v", job)
+	}
+}
+
 func TestJobEngineStopsAutomaticRollbackAfterThreeFailuresAndOffersManualRecovery(t *testing.T) {
 	t.Parallel()
 	store, jobID := seedQueuedExecutionJob(t)

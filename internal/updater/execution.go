@@ -101,8 +101,8 @@ func (job Job) validateExecutionState() error {
 	if job.Status == JobSucceeded && (job.CurrentHop != job.TotalHops || job.CompletedSteps != job.TotalSteps || job.CurrentVersion != job.TargetVersion) {
 		return fmt.Errorf("succeeded job has incomplete release progress")
 	}
-	if (job.Status == JobFailed || job.Status == JobRolledBack) && job.ErrorCode == "" {
-		return fmt.Errorf("failed or rolled back job requires error_code")
+	if job.Status == JobFailed && job.ErrorCode == "" {
+		return fmt.Errorf("failed job requires error_code")
 	}
 	return nil
 }
@@ -387,7 +387,11 @@ func (engine *JobEngine) resumeRollback(ctx context.Context, job Job) error {
 			job.CurrentHop = completedHopForVersion(plan, job.CurrentVersion)
 			job.CompletedSteps = job.CurrentHop * executionTotalSteps
 		}
-		job.ErrorMessage = "The target release failed validation. The previous release was restored."
+		if job.ErrorCode != "" {
+			job.ErrorMessage = "The target release failed validation. The previous release was restored."
+		} else {
+			job.ErrorMessage = ""
+		}
 		state.DesiredState = DesiredRunning
 	})
 }
