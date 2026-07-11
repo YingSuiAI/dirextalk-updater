@@ -344,9 +344,6 @@ func (runtime *ComposeRuntime) RestoreBackup(ctx context.Context, recovery Backu
 	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("exec", "-T", "postgres", "psql", "-U", "dirextalk_message_server", "-d", "dirextalk_message_server", "-v", "ON_ERROR_STOP=1", "-c", "CHECKPOINT;")...); err != nil {
 		return fmt.Errorf("checkpoint restored PostgreSQL data: %w", err)
 	}
-	if err := runtime.runner.Run(ctx, nil, io.Discard, "sync"); err != nil {
-		return fmt.Errorf("flush restored persistent state: %w", err)
-	}
 	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--force-recreate", "message-server")...); err != nil {
 		return fmt.Errorf("start recovered message-server: %w", err)
 	}
@@ -801,15 +798,18 @@ func (runtime *ComposeRuntime) restoreTar(ctx context.Context, archivePath, dest
 		return fmt.Errorf("open recovery archive: %w", err)
 	}
 	cleanup := "find \"$1\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+	flush := "sync -f \"$1\""
 	extra := []string{"dirextalk-restore", destination}
 	if destination == "/var/dirextalk-message-server" && preserve == "p2p" {
-		cleanup = "find \"$1\" -mindepth 1 -maxdepth 1 ! -name \"$2\" -exec rm -rf -- {} +"
+		cleanup = "find \"$1\" -mindepth 1 -maxdepth 1 ! -name \"$2\" ! -name plugins ! -name agent -exec rm -rf -- {} +; " +
+			"for mount in plugins agent; do if [ -d \"$1/$mount\" ]; then find \"$1/$mount\" -mindepth 1 -exec rm -rf -- {} +; fi; done"
+		flush += "; for mount in plugins agent; do if [ -d \"$1/$mount\" ]; then sync -f \"$1/$mount\"; fi; done"
 		extra = append(extra, preserve)
 	} else if destination != "/etc/dirextalk-message-server" || preserve != "" {
 		_ = archive.Close()
 		return fmt.Errorf("persistent restore destination is not allowed")
 	}
-	args := runtime.composeArgs("run", "--rm", "--no-deps", "--entrypoint", "/bin/sh", "message-server", "-ec", cleanup+"; tar -C \"$1\" -xf -; sync")
+	args := runtime.composeArgs("run", "--rm", "--no-deps", "--entrypoint", "/bin/sh", "message-server", "-ec", cleanup+"; tar -C \"$1\" -xf -; "+flush)
 	args = append(args, extra...)
 	err = runtime.runner.Run(ctx, archive, io.Discard, "docker", args...)
 	closeErr := archive.Close()

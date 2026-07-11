@@ -331,13 +331,21 @@ func TestComposeRuntimeRestoresOnlyTheCommittedRecoveryPoint(t *testing.T) {
 		t.Fatalf("restore did not repin source digest: %q", environment)
 	}
 	joined := strings.Join(runner.calls, "\n")
-	for _, required := range []string{"docker image inspect", " stop message-server", " pg_restore ", "CHECKPOINT;", "sync", " up -d --no-deps --force-recreate message-server"} {
+	for _, required := range []string{"docker image inspect", " stop message-server", " pg_restore ", "CHECKPOINT;", `sync -f "$1"`, " up -d --no-deps --force-recreate message-server"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("restore command %q missing from:\n%s", required, joined)
 		}
 	}
 	if strings.Contains(joined, "docker pull "+recovery.ImageRef) {
 		t.Fatal("rollback fetched the recovery image even though the exact local digest was available")
+	}
+	for _, required := range []string{`! -name "$2" ! -name plugins ! -name agent`, `for mount in plugins agent`, `find "$1/$mount"`} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("restore did not preserve and clear nested volume mountpoints (%q):\n%s", required, joined)
+		}
+	}
+	if strings.Contains(joined, "\nsync\n") {
+		t.Fatal("restore used an unbounded host-wide sync")
 	}
 
 	tampered := recovery

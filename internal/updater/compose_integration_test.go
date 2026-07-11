@@ -308,6 +308,8 @@ func writeComposeFixture(t *testing.T, root, image string) {
       - message-config:/etc/dirextalk-message-server
       - message-data:/var/dirextalk-message-server
       - ./p2p:/var/dirextalk-message-server/p2p
+      - plugin-data:/var/dirextalk-message-server/plugins
+      - agent-data:/var/dirextalk-message-server/agent
       - ./health.json:/www/_p2p/health:ro
   caddy:
     image: ${FIXTURE_IMAGE}
@@ -315,6 +317,8 @@ volumes:
   postgres-data:
   message-config:
   message-data:
+  plugin-data:
+  agent-data:
 `
 	write("docker-compose.yml", compose, 0o600)
 }
