@@ -109,6 +109,30 @@ func TestJobBearerIsHashedAndAuthorizesPublicStatus(t *testing.T) {
 	}
 }
 
+func TestPublicJobSupportsBrowserCORSPreflight(t *testing.T) {
+	service, _ := newTestService(t)
+	request := httptest.NewRequest(http.MethodOptions, publicJobsPrefix+"job_browser", nil)
+	request.Header.Set("Origin", "http://127.0.0.1:8765")
+	request.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	request.Header.Set("Access-Control-Request-Headers", "authorization")
+	response := httptest.NewRecorder()
+
+	service.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("preflight status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("allow origin=%q", got)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS" {
+		t.Fatalf("allow methods=%q", got)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Headers"); got != "Accept, Authorization, Content-Type" {
+		t.Fatalf("allow headers=%q", got)
+	}
+}
+
 func TestPublicRestartOperationRequiresOfferedOperationAndJobBearer(t *testing.T) {
 	service, store := newTestService(t)
 	created := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"restart-request","confirm":"apply_release_change"}`, testControlToken, "")

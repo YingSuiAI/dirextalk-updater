@@ -521,6 +521,13 @@ func publicJobOperations(job Job) []JobOperation {
 }
 
 func (service *Service) servePublicJob(response http.ResponseWriter, request *http.Request) {
+	response.Header().Set("Access-Control-Allow-Origin", "*")
+	response.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	response.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
+	if request.Method == http.MethodOptions {
+		response.WriteHeader(http.StatusNoContent)
+		return
+	}
 	remainder := strings.TrimPrefix(request.URL.Path, publicJobsPrefix)
 	parts := strings.Split(remainder, "/")
 	if len(parts) == 1 && parts[0] != "" {
