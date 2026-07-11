@@ -21,6 +21,21 @@ func TestLoadConfigAcceptsOnlyUpdaterOwnedPaths(t *testing.T) {
 	if config.CaddyMode != CaddyModeCompose {
 		t.Fatalf("legacy config did not default to compose Caddy: %#v", config)
 	}
+	if config.ComposeProject != ComposeProjectStandard {
+		t.Fatalf("legacy config did not default to standard Compose project: %#v", config)
+	}
+}
+
+func TestLoadConfigAcceptsOnlyFixedComposeProjects(t *testing.T) {
+	for _, project := range []ComposeProject{ComposeProjectStandard, ComposeProjectLegacy} {
+		config, err := LoadConfig(strings.NewReader(`{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","compose_project":"` + string(project) + `"}`))
+		if err != nil || config.ComposeProject != project {
+			t.Fatalf("project %q rejected: config=%#v err=%v", project, config, err)
+		}
+	}
+	if _, err := LoadConfig(strings.NewReader(`{"schema_version":1,"state_dir":"/var/lib/dirextalk-updater","socket_path":"/run/dirextalk-updater/http.sock","control_token_file":"/etc/dirextalk-updater/control-token","compose_project":"attacker"}`)); err == nil {
+		t.Fatal("unknown Compose project was accepted")
+	}
 }
 
 func TestLoadConfigAcceptsOnlyFixedCaddyModes(t *testing.T) {

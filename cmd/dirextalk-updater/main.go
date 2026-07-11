@@ -62,7 +62,7 @@ func runServer(configPath string) error {
 		return err
 	}
 	store := updater.NewStateStore(filepath.Join(config.StateDir, "runtime.json"))
-	runtime, err := updater.NewComposeRuntime(config.CaddyMode)
+	runtime, err := updater.NewComposeRuntime(config.CaddyMode, config.ComposeProject)
 	if err != nil {
 		return err
 	}

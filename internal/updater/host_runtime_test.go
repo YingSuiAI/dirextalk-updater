@@ -467,8 +467,24 @@ func TestComposeRuntimeWatchdogRepairUsesPinnedLocalImageAndFixedOrder(t *testin
 }
 
 func TestNewComposeRuntimeRejectsUnknownCaddyMode(t *testing.T) {
-	if _, err := NewComposeRuntime(CaddyMode("attacker.service")); err == nil {
+	if _, err := NewComposeRuntime(CaddyMode("attacker.service"), ComposeProjectStandard); err == nil {
 		t.Fatal("runtime accepted an unknown Caddy mode")
+	}
+	if _, err := NewComposeRuntime(CaddyModeCompose, ComposeProject("attacker")); err == nil {
+		t.Fatal("runtime accepted an unknown Compose project")
+	}
+}
+
+func TestComposeRuntimeUsesSelectedFixedProject(t *testing.T) {
+	paths := testHostPaths(t, t.TempDir())
+	paths.composeProject = ComposeProjectLegacy
+	runtime := newTestComposeRuntime(paths, &fakeHostCommandRunner{})
+	args := runtime.composeArgs("ps")
+	if strings.Join(args, " ") != "compose --project-name dirextalk-message-server --file "+paths.composeFile+" ps" {
+		t.Fatalf("unexpected Compose args: %v", args)
+	}
+	if got := composeContainerName(ComposeProjectLegacy, "message-server"); got != "dirextalk-message-server-message-server-1" {
+		t.Fatalf("unexpected legacy container name: %s", got)
 	}
 }
 

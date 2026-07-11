@@ -17,7 +17,7 @@ import (
 
 func TestUbuntuComposeBackupUpgradeAndRollback(t *testing.T) {
 	if os.Getenv("DIREXTALK_UPDATER_COMPOSE_INTEGRATION") != "1" {
-		t.Skip("set DIREXTALK_UPDATER_COMPOSE_INTEGRATION=1 on Ubuntu 24.04 with Docker Compose")
+		t.Skip("set DIREXTALK_UPDATER_COMPOSE_INTEGRATION=1 on Ubuntu 22.04 or 24.04 with Docker Compose")
 	}
 	if err := CheckSupportedHost(); err != nil {
 		t.Fatalf("integration host: %v", err)

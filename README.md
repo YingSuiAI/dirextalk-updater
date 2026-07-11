@@ -6,7 +6,7 @@ owns release discovery, compatibility plans, durable job state, and the fixed
 host-operation boundary. It does not accept arbitrary shell, Compose, image,
 or service input from callers.
 
-Version 1 supports only Ubuntu 24.04 on `linux/amd64`. The daemon listens on a
+Version 1 supports Ubuntu 22.04 and 24.04 on `linux/amd64`. The daemon listens on a
 Unix socket; it does not expose a TCP port. The message server may call the
 root-owned control routes through the mounted socket, while a client receives
 only a scoped job bearer for progress polling.
@@ -31,7 +31,7 @@ go build -o dirextalk-updater ./cmd/dirextalk-updater
 ```
 
 `serve` and `trigger-discovery` run a host preflight and refuse every platform
-except Ubuntu 24.04 `linux/amd64`. `resolve-release` and `version` are read-only
+except Ubuntu 22.04 or 24.04 `linux/amd64`. `resolve-release` and `version` are read-only
 development/inspection commands.
 
 ## Runtime configuration
@@ -57,6 +57,9 @@ must be a regular non-symlink file.
 `caddy_mode` is the fixed enum `compose` or `systemd`; omitted legacy configs
 default to `compose`. Systemd mode can operate only `caddy.service`. This mode
 comes only from the root-owned config and is never accepted by the API.
+`compose_project` is optional and defaults to `dirextalk-p2p`. The only other
+accepted value is the code-owned `dirextalk-message-server` legacy migration
+layout. It is root configuration, never a control-API input.
 
 The frozen v1 Unix API prefix is `/_dirextalk/updater/v1/`. It includes control
 routes for release discovery, status, desired state, and job creation, plus a

@@ -13,7 +13,7 @@ import (
 const (
 	SupportedConfigVersion = 1
 
-	AllowedComposeProject  = "dirextalk-p2p"
+	AllowedComposeProject  = string(ComposeProjectStandard)
 	AllowedComposeFile     = "/var/dirextalk-message-server/docker-compose.yml"
 	AllowedImageRepository = "dirextalk/message-server"
 )
@@ -21,14 +21,22 @@ const (
 var fixedServices = [...]string{"postgres", "message-init", "message-server", "caddy"}
 
 type CaddyMode string
+type ComposeProject string
 
 const (
 	CaddyModeCompose CaddyMode = "compose"
 	CaddyModeSystemd CaddyMode = "systemd"
+
+	ComposeProjectStandard ComposeProject = "dirextalk-p2p"
+	ComposeProjectLegacy   ComposeProject = "dirextalk-message-server"
 )
 
 func (mode CaddyMode) valid() bool {
 	return mode == CaddyModeCompose || mode == CaddyModeSystemd
+}
+
+func (project ComposeProject) valid() bool {
+	return project == ComposeProjectStandard || project == ComposeProjectLegacy
 }
 
 func FixedServices() []string {
@@ -36,11 +44,12 @@ func FixedServices() []string {
 }
 
 type Config struct {
-	SchemaVersion    int       `json:"schema_version"`
-	StateDir         string    `json:"state_dir"`
-	SocketPath       string    `json:"socket_path"`
-	ControlTokenFile string    `json:"control_token_file"`
-	CaddyMode        CaddyMode `json:"caddy_mode,omitempty"`
+	SchemaVersion    int            `json:"schema_version"`
+	StateDir         string         `json:"state_dir"`
+	SocketPath       string         `json:"socket_path"`
+	ControlTokenFile string         `json:"control_token_file"`
+	CaddyMode        CaddyMode      `json:"caddy_mode,omitempty"`
+	ComposeProject   ComposeProject `json:"compose_project,omitempty"`
 }
 
 func LoadConfig(reader io.Reader) (Config, error) {
@@ -58,6 +67,12 @@ func LoadConfig(reader io.Reader) (Config, error) {
 	}
 	if config.CaddyMode == "" {
 		config.CaddyMode = CaddyModeCompose
+	}
+	if config.ComposeProject == "" {
+		config.ComposeProject = ComposeProjectStandard
+	}
+	if !config.ComposeProject.valid() {
+		return Config{}, fmt.Errorf("compose_project must be dirextalk-p2p or dirextalk-message-server")
 	}
 	if !config.CaddyMode.valid() {
 		return Config{}, fmt.Errorf("caddy_mode must be compose or systemd")

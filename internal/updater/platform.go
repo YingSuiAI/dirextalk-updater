@@ -24,14 +24,14 @@ func CheckSupportedHost() error {
 
 func ValidateHostPlatform(goos, goarch string, osRelease []byte) error {
 	if goos != "linux" || goarch != "amd64" {
-		return fmt.Errorf("unsupported host %s/%s: dirextalk-updater v1 supports only Ubuntu 24.04 linux/amd64", goos, goarch)
+		return fmt.Errorf("unsupported host %s/%s: dirextalk-updater v1 supports only Ubuntu 22.04 or 24.04 linux/amd64", goos, goarch)
 	}
 	values := parseOSRelease(osRelease)
 	if values["ID"] == "" || values["VERSION_ID"] == "" {
-		return fmt.Errorf("could not identify Ubuntu 24.04 from %s", osReleasePath)
+		return fmt.Errorf("could not identify Ubuntu 22.04 or 24.04 from %s", osReleasePath)
 	}
-	if values["ID"] != "ubuntu" || values["VERSION_ID"] != "24.04" {
-		return fmt.Errorf("unsupported distribution %s %s: dirextalk-updater v1 supports only Ubuntu 24.04", values["ID"], values["VERSION_ID"])
+	if values["ID"] != "ubuntu" || (values["VERSION_ID"] != "22.04" && values["VERSION_ID"] != "24.04") {
+		return fmt.Errorf("unsupported distribution %s %s: dirextalk-updater v1 supports only Ubuntu 22.04 or 24.04", values["ID"], values["VERSION_ID"])
 	}
 	return nil
 }

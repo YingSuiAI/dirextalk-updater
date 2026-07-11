@@ -54,8 +54,25 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  publish:
+  compatibility:
     needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Restore verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Smoke test Ubuntu 22.04 compatibility
+        run: |
+          chmod 0755 dist/dirextalk-updater-linux-amd64
+          (cd dist && sha256sum --check dirextalk-updater-linux-amd64.sha256)
+          ./dist/dirextalk-updater-linux-amd64 version
+
+  publish:
+    needs: [build, compatibility]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

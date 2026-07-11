@@ -78,6 +78,7 @@ func (writer *limitedWriter) Write(data []byte) (int, error) {
 
 type composeRuntimePaths struct {
 	composeFile       string
+	composeProject    ComposeProject
 	envFile           string
 	p2pDir            string
 	backupRoot        string
@@ -97,12 +98,16 @@ type ComposeRuntime struct {
 	caddyMode    CaddyMode
 }
 
-func NewComposeRuntime(caddyMode CaddyMode) (*ComposeRuntime, error) {
+func NewComposeRuntime(caddyMode CaddyMode, composeProject ComposeProject) (*ComposeRuntime, error) {
 	if !caddyMode.valid() {
 		return nil, fmt.Errorf("Caddy mode %q is not supported", caddyMode)
 	}
+	if !composeProject.valid() {
+		return nil, fmt.Errorf("Compose project %q is not supported", composeProject)
+	}
 	paths := composeRuntimePaths{
 		composeFile:       fixedComposeDir + "/docker-compose.yml",
+		composeProject:    composeProject,
 		envFile:           fixedComposeDir + "/.env",
 		p2pDir:            fixedP2PDir,
 		backupRoot:        fixedBackupRoot,
@@ -120,6 +125,9 @@ func NewComposeRuntime(caddyMode CaddyMode) (*ComposeRuntime, error) {
 }
 
 func newComposeRuntime(paths composeRuntimePaths, runner hostCommandRunner, httpClient *http.Client, caddyMode CaddyMode) *ComposeRuntime {
+	if paths.composeProject == "" {
+		paths.composeProject = ComposeProjectStandard
+	}
 	if paths.now == nil {
 		paths.now = time.Now
 	}
@@ -500,7 +508,7 @@ func (runtime *ComposeRuntime) StreamWatchdogEvents(ctx context.Context, notify 
 	}
 	writer := &watchdogEventWriter{notify: notify}
 	return runtime.runner.Run(ctx, nil, writer, "docker", "events",
-		"--filter", "label=com.docker.compose.project="+AllowedComposeProject,
+		"--filter", "label=com.docker.compose.project="+string(runtime.paths.composeProject),
 		"--filter", "event=die",
 		"--filter", "event=stop",
 		"--filter", "event=kill",
@@ -707,14 +715,14 @@ func (runtime *ComposeRuntime) checkCurrentHealthWithMode(ctx context.Context, v
 	} else if runtime.caddyMode != CaddyModeCompose {
 		return runtimeHealth{}, fmt.Errorf("configured Caddy mode is invalid")
 	}
-	containerState, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", composeContainerName("message-server"))
+	containerState, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", composeContainerName(runtime.paths.composeProject, "message-server"))
 	if err != nil {
 		return runtimeHealth{}, err
 	}
 	if strings.TrimSpace(containerState) != "running healthy" {
 		return runtimeHealth{}, fmt.Errorf("message-server container is not running and Docker-healthy")
 	}
-	imageRef, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.Config.Image}}", composeContainerName("message-server"))
+	imageRef, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.Config.Image}}", composeContainerName(runtime.paths.composeProject, "message-server"))
 	if err != nil {
 		return runtimeHealth{}, err
 	}
@@ -868,12 +876,12 @@ func (runtime *ComposeRuntime) writeCommandFile(ctx context.Context, path string
 }
 
 func (runtime *ComposeRuntime) composeArgs(args ...string) []string {
-	prefix := []string{"compose", "--project-name", AllowedComposeProject, "--file", runtime.paths.composeFile}
+	prefix := []string{"compose", "--project-name", string(runtime.paths.composeProject), "--file", runtime.paths.composeFile}
 	return append(prefix, args...)
 }
 
-func composeContainerName(service string) string {
-	return AllowedComposeProject + "-" + service + "-1"
+func composeContainerName(project ComposeProject, service string) string {
+	return string(project) + "-" + service + "-1"
 }
 
 func parsePinnedImageRef(value string) (string, string, error) {

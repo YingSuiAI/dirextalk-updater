@@ -7,7 +7,7 @@ the application is down.
 
 ## Supported Platform
 
-- Version 1 supports Ubuntu 24.04 on `linux/amd64` only.
+- Version 1 supports Ubuntu 22.04 and 24.04 on `linux/amd64` only.
 - Do not add architecture matrices, cross-platform service managers, or
   compatibility claims without an explicit product decision and real-host
   verification.
@@ -28,7 +28,9 @@ the application is down.
 - Keep request bodies declarative. Callers must not provide shell commands,
   Compose paths, service names, image repositories, or digests.
 - Preserve the fixed Compose project, file, image repository, and service
-  allowlist in code-owned configuration.
+  allowlist in code-owned configuration. `compose_project` is limited to the
+  code-owned `dirextalk-p2p` and `dirextalk-message-server` migration layouts;
+  it is never accepted from the control API.
 - Persist state atomically and durably. A new job and the transition to
   `upgrading` are one transaction; only one active job is allowed. External
   desired-state calls cannot select `upgrading` or overwrite any state while a
@@ -54,7 +56,8 @@ the application is down.
 3. Run `go test ./...`, `go test -race ./...`, `go vet ./...`, and
    `go mod verify`.
 4. Build `GOOS=linux GOARCH=amd64` and smoke-test its `version` command on an
-   Ubuntu 24.04 runner or host.
+   Ubuntu 24.04 runner; run host integration on Ubuntu 22.04 or 24.04 as
+   appropriate for the changed path.
 5. Run `git diff --check`, inspect all changes, and commit a focused change.
 
 ## Release Contract

@@ -9,21 +9,21 @@ import (
 	"testing"
 )
 
-func TestCIAndReleaseWorkflowsStayUbuntu2404AMD64Only(t *testing.T) {
+func TestCIAndReleaseWorkflowsCoverSupportedUbuntuAMD64Hosts(t *testing.T) {
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate test file")
 	}
 	root := filepath.Dir(filepath.Dir(filename))
 	ci := readWorkflow(t, filepath.Join(root, ".github", "workflows", "ci.yml"))
-	for _, required := range []string{"ubuntu-24.04", "contents: read", "persist-credentials: false", "go-version: '1.24.13'", "go test ./...", "go test -race ./...", "go vet ./...", "GOOS=linux GOARCH=amd64", "dirextalk-updater-linux-amd64", "version"} {
+	for _, required := range []string{"ubuntu-22.04", "ubuntu-24.04", "contents: read", "persist-credentials: false", "go-version: '1.24.13'", "go test ./...", "go test -race ./...", "go vet ./...", "GOOS=linux GOARCH=amd64", "dirextalk-updater-linux-amd64", "version"} {
 		if !strings.Contains(ci, required) {
 			t.Fatalf("CI workflow is missing %q", required)
 		}
 	}
 
 	release := readWorkflow(t, filepath.Join(root, ".github", "workflows", "release.yml"))
-	for _, required := range []string{"ubuntu-24.04", "tags:", "- 'v*.*.*'", "build:", "publish:", "needs: build", "contents: read", "contents: write", "persist-credentials: false", "go-version: '1.24.13'", "git show -s --format=%ct", "scripts/build-release.sh", "actions/upload-artifact@", "actions/download-artifact@", "GH_REPO: ${{ github.repository }}", "dirextalk-updater-linux-amd64", "dirextalk-updater-linux-amd64.sha256", "dirextalk-updater-release.json", "gh release create"} {
+	for _, required := range []string{"ubuntu-22.04", "ubuntu-24.04", "tags:", "- 'v*.*.*'", "build:", "compatibility:", "publish:", "needs: [build, compatibility]", "contents: read", "contents: write", "persist-credentials: false", "go-version: '1.24.13'", "git show -s --format=%ct", "scripts/build-release.sh", "actions/upload-artifact@", "actions/download-artifact@", "GH_REPO: ${{ github.repository }}", "dirextalk-updater-linux-amd64", "dirextalk-updater-linux-amd64.sha256", "dirextalk-updater-release.json", "gh release create"} {
 		if !strings.Contains(release, required) {
 			t.Fatalf("release workflow is missing %q", required)
 		}
