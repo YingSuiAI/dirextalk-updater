@@ -13,7 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"reflect"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -21,7 +21,6 @@ import (
 const (
 	apiPrefix               = "/_dirextalk/updater/v1/"
 	controlJobsPath         = apiPrefix + "control/jobs"
-	controlDiscoveryPath    = apiPrefix + "control/discovery"
 	controlStatusPath       = apiPrefix + "control/status"
 	controlDesiredStatePath = apiPrefix + "control/desired-state"
 	publicJobsPrefix        = apiPrefix + "jobs/"
@@ -30,11 +29,13 @@ const (
 	maxRequestBytes         = 64 * 1024
 )
 
+var canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
 type Service struct {
 	store            *StateStore
 	controlTokenHash string
 	now              func() time.Time
-	releaseSource    ReleaseSource
+	directRuntime    DirectJobRuntime
 	jobEngine        *JobEngine
 	jobSignal        chan struct{}
 	logf             func(string, ...any)
@@ -43,9 +44,11 @@ type Service struct {
 
 type ServiceOption func(*Service)
 
-func WithReleaseSource(source ReleaseSource) ServiceOption {
+// WithDirectJobRuntime connects the fixed host runtime to the control plane.
+// Central direct upgrades never fetch or trust GitHub release metadata.
+func WithDirectJobRuntime(runtime DirectJobRuntime) ServiceOption {
 	return func(service *Service) {
-		service.releaseSource = source
+		service.directRuntime = runtime
 	}
 }
 
@@ -132,74 +135,8 @@ func (service *Service) Handler() http.Handler {
 	return http.HandlerFunc(service.serveHTTP)
 }
 
-func (service *Service) RegisterPlan(ctx context.Context, rawToken string, plan Plan) error {
-	if strings.TrimSpace(rawToken) == "" {
-		return fmt.Errorf("plan token is required")
-	}
-	if plan.LegacyUnbound {
-		return fmt.Errorf("legacy unbound plans cannot be registered")
-	}
-	if err := plan.Manifest.Validate(); err != nil {
-		return err
-	}
-	if !digestPattern.MatchString(plan.ManifestDigest) {
-		return fmt.Errorf("plan manifest_digest is invalid")
-	}
-	if len(plan.ReleaseChain) > 0 {
-		if err := validatePlanReleaseChain(plan); err != nil {
-			return err
-		}
-	} else if _, err := parseCanonicalVersion("current_version", plan.CurrentVersion); err != nil {
-		return err
-	}
-	if !plan.ExpiresAt.After(service.now()) {
-		return fmt.Errorf("plan expiry must be in the future")
-	}
-	return service.store.Update(ctx, func(state *RuntimeState) error {
-		if effectiveDiscoveryStatus(state.Discovery, service.now()) != DiscoveryFresh || state.Discovery.Manifest == nil || state.Discovery.Index == nil {
-			return fmt.Errorf("a fresh discovered release is required")
-		}
-		if state.DesiredState != DesiredRunning {
-			return fmt.Errorf("desired state must be running to register a plan")
-		}
-		if hasActiveJob(*state) {
-			return fmt.Errorf("an operation is already in progress")
-		}
-		discoveredChain, pathErr := state.Discovery.Index.UpgradePath(plan.CurrentVersion)
-		if len(plan.ReleaseChain) == 0 {
-			plan.ReleaseChain = discoveredChain
-		}
-		if pathErr != nil || !reflect.DeepEqual(discoveredChain, plan.ReleaseChain) || state.Discovery.ManifestDigest != plan.ManifestDigest || !reflect.DeepEqual(*state.Discovery.Manifest, plan.Manifest) {
-			return fmt.Errorf("plan release chain does not match the discovered release index")
-		}
-		if err := validatePlanReleaseChain(plan); err != nil {
-			return err
-		}
-		for _, step := range plan.ReleaseChain {
-			if len(step.SourceImageDigests) == 0 {
-				return fmt.Errorf("plan source image digests are required")
-			}
-		}
-		planHash := tokenHash(rawToken)
-		if existing, ok := state.Plans[planHash]; ok {
-			if reflect.DeepEqual(existing, plan) {
-				return nil
-			}
-			return fmt.Errorf("plan token is already bound to a different plan")
-		}
-		state.Plans[planHash] = plan
-		return nil
-	})
-}
-
 func (service *Service) serveHTTP(response http.ResponseWriter, request *http.Request) {
 	switch {
-	case request.URL.Path == controlDiscoveryPath:
-		if request.Method != http.MethodPost {
-			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
-			return
-		}
-		service.refreshDiscovery(response, request)
 	case request.URL.Path == controlJobsPath:
 		if request.Method != http.MethodPost {
 			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
@@ -225,30 +162,8 @@ func (service *Service) serveHTTP(response http.ResponseWriter, request *http.Re
 	}
 }
 
-func (service *Service) refreshDiscovery(response http.ResponseWriter, request *http.Request) {
-	if !service.controlAuthorized(request) {
-		writeAPIError(response, http.StatusUnauthorized, "control_token_required")
-		return
-	}
-	if service.releaseSource == nil {
-		writeAPIError(response, http.StatusServiceUnavailable, "release_source_unavailable")
-		return
-	}
-	var input struct{}
-	if err := decodeControlRequest(response, request, &input, "discovery request"); err != nil {
-		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
-		return
-	}
-	cache, err := RefreshDiscovery(request.Context(), service.store, service.releaseSource, service.now())
-	if err != nil {
-		writeAPIError(response, http.StatusBadGateway, "release_discovery_failed")
-		return
-	}
-	writeJSON(response, http.StatusOK, cache)
-}
-
 type createJobRequest struct {
-	PlanToken      string `json:"plan_token"`
+	TargetVersion  string `json:"target_version"`
 	IdempotencyKey string `json:"idempotency_key"`
 	Confirm        string `json:"confirm"`
 }
@@ -293,24 +208,27 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
 		return
 	}
-	input.PlanToken = strings.TrimSpace(input.PlanToken)
+	input.TargetVersion = strings.TrimSpace(input.TargetVersion)
 	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
-	if input.PlanToken == "" || input.IdempotencyKey == "" || len(input.IdempotencyKey) > 128 || input.Confirm != applyConfirmation {
+	if _, err := parseCanonicalVersion("target_version", input.TargetVersion); err != nil || !canonicalUUIDPattern.MatchString(input.IdempotencyKey) || input.Confirm != applyConfirmation {
 		writeAPIError(response, http.StatusBadRequest, "invalid_request")
 		return
 	}
+	if service.directRuntime == nil {
+		writeAPIError(response, http.StatusServiceUnavailable, "updater_not_ready")
+		return
+	}
 
-	planHash := tokenHash(input.PlanToken)
 	snapshot, err := service.store.Load(request.Context())
 	if err != nil {
 		writeAPIError(response, http.StatusInternalServerError, "state_read_failed")
 		return
 	}
 	if existingID, exists := snapshot.Idempotency[input.IdempotencyKey]; exists {
-		service.replayJob(response, request, existingID, planHash)
+		service.replayDirectJob(response, request, existingID, input.TargetVersion)
 		return
 	}
-	if rejection := preflightNewJob(snapshot, planHash, service.now()); rejection != nil {
+	if rejection := preflightDirectJob(snapshot); rejection != nil {
 		writeAPIError(response, rejection.status, rejection.code)
 		return
 	}
@@ -322,6 +240,26 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 	if request.Context().Err() != nil {
 		return
 	}
+	currentVersion, currentErr := service.directRuntime.CurrentVersion(request.Context())
+	if currentErr != nil {
+		writeAPIError(response, http.StatusServiceUnavailable, "runtime_status_unavailable")
+		return
+	}
+	current, currentParseErr := parseCanonicalVersion("current_version", currentVersion)
+	target, _ := parseCanonicalVersion("target_version", input.TargetVersion)
+	if currentParseErr != nil {
+		writeAPIError(response, http.StatusServiceUnavailable, "runtime_status_unavailable")
+		return
+	}
+	if !current.LessThan(target) {
+		writeAPIError(response, http.StatusConflict, "target_not_newer")
+		return
+	}
+	directRelease, resolveErr := service.directRuntime.ResolveDirectRelease(request.Context(), input.TargetVersion)
+	if resolveErr != nil || directRelease.Validate() != nil || directRelease.Version != input.TargetVersion {
+		writeAPIError(response, http.StatusBadGateway, "target_resolution_failed")
+		return
+	}
 
 	var ticket JobTicket
 	var rejection *mutationRejection
@@ -331,7 +269,7 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 			if !jobExists {
 				return rejectMutation(http.StatusInternalServerError, "state_inconsistent")
 			}
-			if job.PlanTokenHash != planHash {
+			if job.DirectRelease == nil || job.TargetVersion != input.TargetVersion {
 				return rejectMutation(http.StatusConflict, "idempotency_conflict")
 			}
 			rawBearer, tokenErr := randomToken(32)
@@ -344,17 +282,8 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 			ticket = JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}
 			return nil
 		}
-		plan, ok := state.Plans[planHash]
-		if !ok || !plan.ExpiresAt.After(service.now()) {
-			return rejectMutation(http.StatusConflict, "plan_invalid_or_expired")
-		}
 		if hasActiveJob(*state) {
 			return rejectMutation(http.StatusConflict, "operation_in_progress")
-		}
-		for _, existing := range state.Jobs {
-			if existing.PlanTokenHash == planHash {
-				return rejectMutation(http.StatusConflict, "plan_already_used")
-			}
 		}
 		if state.DesiredState != DesiredRunning {
 			return rejectMutation(http.StatusConflict, "desired_state_not_running")
@@ -372,17 +301,16 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		job := Job{
 			ID:                "job_" + jobIDToken,
 			Status:            JobQueued,
-			PlanTokenHash:     planHash,
-			ManifestDigest:    plan.ManifestDigest,
+			DirectRelease:     &directRelease,
 			BearerTokenHashes: []string{tokenHash(rawBearer)},
 			IdempotencyKey:    input.IdempotencyKey,
-			CurrentVersion:    plan.CurrentVersion,
-			TargetVersion:     plan.Manifest.Version,
+			CurrentVersion:    currentVersion,
+			TargetVersion:     directRelease.Version,
 			CurrentStep:       JobStepValidate,
-			TotalSteps:        executionTotalSteps * len(plan.ReleaseChain),
-			TotalHops:         len(plan.ReleaseChain),
+			TotalSteps:        executionTotalSteps,
+			TotalHops:         1,
 			ServiceAvailable:  true,
-			LastSafeVersion:   plan.CurrentVersion,
+			LastSafeVersion:   currentVersion,
 			CreatedAt:         now,
 			UpdatedAt:         now,
 		}
@@ -405,7 +333,7 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 	writeJSON(response, http.StatusAccepted, ticket)
 }
 
-func (service *Service) replayJob(response http.ResponseWriter, request *http.Request, existingID, planHash string) {
+func (service *Service) replayDirectJob(response http.ResponseWriter, request *http.Request, existingID, targetVersion string) {
 	var ticket JobTicket
 	var rejection *mutationRejection
 	err := service.store.Update(request.Context(), func(state *RuntimeState) error {
@@ -413,7 +341,7 @@ func (service *Service) replayJob(response http.ResponseWriter, request *http.Re
 		if !exists {
 			return rejectMutation(http.StatusInternalServerError, "state_inconsistent")
 		}
-		if job.PlanTokenHash != planHash {
+		if job.DirectRelease == nil || job.TargetVersion != targetVersion {
 			return rejectMutation(http.StatusConflict, "idempotency_conflict")
 		}
 		rawBearer, tokenErr := randomToken(32)
@@ -437,18 +365,9 @@ func (service *Service) replayJob(response http.ResponseWriter, request *http.Re
 	writeJSON(response, http.StatusAccepted, ticket)
 }
 
-func preflightNewJob(state RuntimeState, planHash string, now time.Time) *mutationRejection {
-	plan, ok := state.Plans[planHash]
-	if !ok || !plan.ExpiresAt.After(now) {
-		return &mutationRejection{status: http.StatusConflict, code: "plan_invalid_or_expired"}
-	}
+func preflightDirectJob(state RuntimeState) *mutationRejection {
 	if hasActiveJob(state) {
 		return &mutationRejection{status: http.StatusConflict, code: "operation_in_progress"}
-	}
-	for _, existing := range state.Jobs {
-		if existing.PlanTokenHash == planHash {
-			return &mutationRejection{status: http.StatusConflict, code: "plan_already_used"}
-		}
 	}
 	if state.DesiredState != DesiredRunning {
 		return &mutationRejection{status: http.StatusConflict, code: "desired_state_not_running"}
@@ -511,9 +430,6 @@ func publicJobView(job Job) publicJob {
 
 func publicJobOperations(job Job) []JobOperation {
 	operations := []JobOperation{}
-	if (job.Status == JobSucceeded || job.Status == JobFailed) && job.RecoveryPoint != nil {
-		operations = append(operations, JobOperation{Kind: "rollback"})
-	}
 	if job.Status == JobFailed && !job.ServiceAvailable {
 		operations = append(operations, JobOperation{Kind: "restart"})
 	}
@@ -538,7 +454,7 @@ func (service *Service) servePublicJob(response http.ResponseWriter, request *ht
 		service.getJob(response, request, parts[0])
 		return
 	}
-	if len(parts) == 2 && parts[0] != "" && (parts[1] == "rollback" || parts[1] == "restart") {
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "restart" {
 		if request.Method != http.MethodPost {
 			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
 			return
@@ -607,14 +523,8 @@ func (service *Service) startJobOperation(response http.ResponseWriter, request 
 		suppressWatchdog(state)
 		job.ServiceAvailable = false
 		job.RecoveryAttempts = 0
-		switch kind {
-		case "rollback":
-			job.Status = JobRollingBack
-			job.CurrentStep = JobStepRestoreBackup
-		case "restart":
-			job.Status = JobRestarting
-			job.CurrentStep = JobStepRestart
-		}
+		job.Status = JobRestarting
+		job.CurrentStep = JobStepRestart
 		job.UpdatedAt = service.now().UTC()
 		state.Jobs[jobID] = job
 		updated = job

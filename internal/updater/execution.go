@@ -116,6 +116,15 @@ type UpgradeRuntime interface {
 	RestartCurrent(context.Context, Job) error
 }
 
+// DirectUpgradeRuntime executes the single-hop, centrally selected release
+// path. It intentionally has no release-index or GitHub input.
+type DirectUpgradeRuntime interface {
+	UpgradeRuntime
+	PrepareDirectBackup(context.Context, Job, DirectRelease, func(JobStatus) error) (BackupMetadata, error)
+	ActivateDirectTarget(context.Context, DirectRelease, func(JobStatus) error) error
+	CheckDirectTarget(context.Context, DirectRelease) error
+}
+
 type JobEngine struct {
 	store   *StateStore
 	runtime UpgradeRuntime
@@ -136,6 +145,9 @@ func (engine *JobEngine) RunActive(ctx context.Context) error {
 		job, plan, found, err := engine.activeJob(ctx)
 		if err != nil || !found {
 			return err
+		}
+		if job.DirectRelease != nil {
+			return engine.runDirectActive(ctx, job)
 		}
 		if job.Status == JobQueued {
 			if err := engine.updateJob(ctx, job.ID, func(job *Job, _ *RuntimeState) {
@@ -284,6 +296,125 @@ func (engine *JobEngine) RunActive(ctx context.Context) error {
 	}
 }
 
+func (engine *JobEngine) runDirectActive(ctx context.Context, initial Job) error {
+	runtime, ok := engine.runtime.(DirectUpgradeRuntime)
+	if !ok {
+		return fmt.Errorf("job engine runtime does not support direct upgrades")
+	}
+	job := initial
+	for {
+		if job.DirectRelease == nil {
+			return fmt.Errorf("direct job %s has no direct target", job.ID)
+		}
+		target := *job.DirectRelease
+		if err := target.Validate(); err != nil {
+			return fmt.Errorf("direct job %s target is invalid: %w", job.ID, err)
+		}
+		if job.Status == JobQueued {
+			if err := engine.updateJob(ctx, job.ID, func(job *Job, _ *RuntimeState) {
+				job.Status = JobValidating
+				job.CurrentStep = JobStepValidate
+			}); err != nil {
+				return err
+			}
+			job.Status = JobValidating
+			job.CurrentStep = JobStepValidate
+			continue
+		}
+		if job.Status == JobRollingBack {
+			return engine.resumeRollback(ctx, job)
+		}
+		if job.Status == JobRestarting {
+			return engine.resumeRestart(ctx, job)
+		}
+
+		switch job.Status {
+		case JobValidating, JobBackingUp:
+			recovery, prepareErr := runtime.PrepareDirectBackup(ctx, job, target, engine.progress(ctx, job.ID))
+			if prepareErr != nil {
+				if err := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_failed", errorServiceAvailable(prepareErr)); err != nil {
+					return errors.Join(prepareErr, err)
+				}
+				return fmt.Errorf("prepare direct recovery point: %w", prepareErr)
+			}
+			if err := validateBackupMetadataShape(recovery); err != nil {
+				validationErr := fmt.Errorf("prepared direct recovery point is invalid: %w", err)
+				if persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_invalid", true); persistErr != nil {
+					return errors.Join(validationErr, persistErr)
+				}
+				return validationErr
+			}
+			if recovery.JobID != job.ID || recovery.Version != job.CurrentVersion {
+				validationErr := fmt.Errorf("prepared direct recovery point does not match job")
+				if persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "backup_invalid", true); persistErr != nil {
+					return errors.Join(validationErr, persistErr)
+				}
+				return validationErr
+			}
+			if err := engine.updateJob(ctx, job.ID, func(job *Job, state *RuntimeState) {
+				for priorID, prior := range state.Jobs {
+					if priorID != job.ID && !prior.Status.active() && prior.RecoveryPoint != nil {
+						prior.RecoveryPoint = nil
+						state.Jobs[priorID] = prior
+					}
+				}
+				job.RecoveryPoint = &recovery
+				job.Status = JobPulling
+				job.CompletedSteps = 2
+				job.ServiceAvailable = true
+				job.CurrentStep = JobStepPulling
+			}); err != nil {
+				return err
+			}
+			job.RecoveryPoint = &recovery
+			job.Status = JobPulling
+			job.CompletedSteps = 2
+			job.ServiceAvailable = true
+			job.CurrentStep = JobStepPulling
+			fallthrough
+		case JobPulling, JobStopping, JobMigrating, JobStarting:
+			if activateErr := runtime.ActivateDirectTarget(ctx, target, engine.progress(ctx, job.ID)); activateErr != nil {
+				if !errorMutationStarted(activateErr) {
+					persistErr := engine.finishBeforeMutationFailure(ctx, job.ID, "target_activation_failed", errorServiceAvailable(activateErr))
+					return errors.Join(fmt.Errorf("activate direct target before host mutation: %w", activateErr), persistErr)
+				}
+				return engine.beginAndRunRollback(ctx, job, "target_activation_failed", activateErr)
+			}
+			if err := engine.updateJob(ctx, job.ID, func(job *Job, _ *RuntimeState) {
+				job.Status = JobHealthCheck
+				job.CompletedSteps = 6
+				job.ServiceAvailable = false
+				job.CurrentStep = JobStepCheckTarget
+			}); err != nil {
+				return err
+			}
+			job.Status = JobHealthCheck
+			job.CompletedSteps = 6
+			job.ServiceAvailable = false
+			job.CurrentStep = JobStepCheckTarget
+			fallthrough
+		case JobHealthCheck:
+			if healthErr := runtime.CheckDirectTarget(ctx, target); healthErr != nil {
+				return engine.beginAndRunRollback(ctx, job, "target_health_failed", healthErr)
+			}
+			return engine.updateJob(ctx, job.ID, func(job *Job, state *RuntimeState) {
+				job.CurrentVersion = target.Version
+				job.CurrentHop = 1
+				job.CompletedSteps = executionTotalSteps
+				job.ServiceAvailable = true
+				job.LastSafeVersion = target.Version
+				job.ErrorCode = ""
+				job.ErrorMessage = ""
+				job.Status = JobSucceeded
+				job.CurrentStep = JobStepComplete
+				state.DesiredState = DesiredRunning
+			})
+		default:
+			return fmt.Errorf("active direct job %s has unsupported status %q", job.ID, job.Status)
+		}
+	}
+}
+
 func digestAllowed(observed string, allowed []string) bool {
 	for _, digest := range allowed {
 		if observed == digest {
@@ -386,6 +517,9 @@ func (engine *JobEngine) resumeRollback(ctx context.Context, job Job) error {
 		if plan, ok := state.Plans[job.PlanTokenHash]; ok {
 			job.CurrentHop = completedHopForVersion(plan, job.CurrentVersion)
 			job.CompletedSteps = job.CurrentHop * executionTotalSteps
+		} else if job.DirectRelease != nil {
+			job.CurrentHop = 0
+			job.CompletedSteps = 0
 		}
 		if job.ErrorCode != "" {
 			job.ErrorMessage = "The target release failed validation. The previous release was restored."
@@ -415,7 +549,7 @@ func (engine *JobEngine) recordRecoveryFailure(ctx context.Context, job Job, cau
 			stored.Status = JobFailed
 			stored.CurrentStep = JobStepComplete
 			stored.ErrorCode = "rollback_failed"
-			stored.ErrorMessage = "Automatic rollback could not restore service. Manual rollback or restart is available."
+			stored.ErrorMessage = "Automatic recovery could not restore service. Restart remains available."
 			state.DesiredState = DesiredMaintenance
 			return
 		}
@@ -439,7 +573,7 @@ func (engine *JobEngine) resumeRestart(ctx context.Context, job Job) error {
 				stored.Status = JobFailed
 				stored.CurrentStep = JobStepComplete
 				stored.ErrorCode = "restart_failed"
-				stored.ErrorMessage = "The service could not be restarted. Retry restart or use the committed rollback."
+				stored.ErrorMessage = "The service could not be restarted. Retry restart after resolving the host failure."
 				state.DesiredState = DesiredMaintenance
 			}
 		})
@@ -507,6 +641,9 @@ func (engine *JobEngine) activeJob(ctx context.Context) (Job, Plan, bool, error)
 	}
 	if active == nil {
 		return Job{}, Plan{}, false, nil
+	}
+	if active.DirectRelease != nil {
+		return *active, Plan{}, true, nil
 	}
 	plan, ok := state.Plans[active.PlanTokenHash]
 	if !ok {

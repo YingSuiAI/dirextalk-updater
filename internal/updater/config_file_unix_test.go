@@ -16,6 +16,9 @@ func TestLoadConfigFileRequiresRootOwnedPrivateRegularFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(validConfigFileJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := LoadConfigFile(path); err == nil {
 		t.Fatal("public updater config was accepted")
 	}

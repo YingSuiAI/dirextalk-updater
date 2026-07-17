@@ -2,9 +2,10 @@
 
 Dirextalk Updater is a small host service that keeps server upgrade control
 available while the containerized message server is stopped or restarting. It
-owns release discovery, compatibility plans, durable job state, and the fixed
+accepts a centrally selected stable target version, pins that target to its
+resolved Docker digest, and owns durable job state plus the fixed
 host-operation boundary. It does not accept arbitrary shell, Compose, image,
-or service input from callers.
+digest, URL, or service input from callers.
 
 Version 1 supports Ubuntu 22.04 and 24.04 on `linux/amd64`. The daemon listens on a
 Unix socket; it does not expose a TCP port. The message server may call the
@@ -30,9 +31,9 @@ go build -o dirextalk-updater ./cmd/dirextalk-updater
 ./dirextalk-updater version
 ```
 
-`serve` and `trigger-discovery` run a host preflight and refuse every platform
-except Ubuntu 22.04 or 24.04 `linux/amd64`. `resolve-release` and `version` are read-only
-development/inspection commands.
+`serve` runs a host preflight and refuses every platform except Ubuntu 22.04
+or 24.04 `linux/amd64`. `version` is read-only and may run on development
+systems.
 
 ## Runtime configuration
 
@@ -61,27 +62,31 @@ comes only from the root-owned config and is never accepted by the API.
 accepted value is the code-owned `dirextalk-message-server` legacy migration
 layout. It is root configuration, never a control-API input.
 
-The frozen v1 Unix API prefix is `/_dirextalk/updater/v1/`. It includes control
-routes for release discovery, status, desired state, and job creation, plus a
-bearer-scoped job status route. Compatibility and operation availability are
-server decisions; clients must not infer an upgrade path locally.
-Discovered Release metadata is fresh for at most 36 hours. Older, future, or
-missing check timestamps are treated as stale and cannot issue a plan.
-Discovery accepts only `release-index.json` and `release-index.json.sha256`
-from the latest published stable GitHub Release. The checksum binds the whole
-index; every embedded manifest has its own digest, and every upgrade edge
-binds exact source image digests. A direct edge is preferred. Otherwise the
-path to the latest release must be unique, and the exact ordered chain is
-persisted in the plan before a job is created.
-Both the index and its embedded manifests use deterministic compact JSON so
-their digests can be rechecked after state persistence. Formal source releases
-must remain in the index. The only unindexed bootstrap source is the explicit
-`v0.15.2 -> v1.0.0` legacy edge.
-That bootstrap edge alone may accept the legacy `{\"status\":\"ok\"}` health
-shape after the canonical pinned image and edge digest match. Its backup records
-an explicit schema `1/1` assumption so only that legacy recovery can use the
-same narrow health check. Watchdog, formal targets, and formal restores remain
-on the complete version/schema health contract.
+The v1 Unix API prefix is `/_dirextalk/updater/v1/`. The root-owned control
+token is required for all control routes. `POST control/status` accepts only
+`{}` and reads the current server version from the host's pinned image. It
+returns `current_version`, `updater_ready`, desired state, any active job, and
+watchdog state.
+
+`POST control/jobs` accepts only this strict request shape:
+
+```json
+{
+  "target_version": "v1.0.3",
+  "idempotency_key": "lowercase UUID",
+  "confirm": "apply_release_change"
+}
+```
+
+The target must be canonical `vX.Y.Z` and greater than the host's current
+version. The updater pulls only `dirextalk/message-server:<target_version>`,
+resolves exactly one repository digest, and atomically persists the
+digest-pinned target before the server is stopped. Every new job is a single
+hop. GitHub Release discovery, release-index freshness, plan tokens, and
+multi-hop selection are not part of the active control path.
+Existing persisted legacy jobs retain their plans only so automatic recovery
+can finish after an updater replacement; no new GitHub-discovered plan can be
+created.
 The `upgrading` desired state is internal to the job transaction, and external
 desired-state changes are rejected while a job is active.
 
@@ -94,17 +99,12 @@ is retained. A corrupt staging backup never replaces it.
 
 The target is pulled and recreated only as `vX.Y.Z@sha256:...`. Success needs
 consecutive agreement between the running container image, PostgreSQL,
-internal health, schema metadata, and the same-domain Caddy health endpoint.
-Failure starts automatic rollback, and every restore checkpoint survives an
-updater restart. After three recovery failures the job enters maintenance and
-offers only the persisted `rollback`/`restart` operations through
-`POST /_dirextalk/updater/v1/jobs/{job_id}/{operation}` with the job bearer.
-No infrastructure parameters are accepted by these routes.
-For a multi-hop plan, each hop independently rotates the single backup,
-activates its immutable image, runs migrations, and passes the complete health
-gate before the next hop starts. An observed source digest mismatch stops
-before target mutation. A later-hop failure restores the most recent healthy
-hop, not the original installation.
+internal health, and the same-domain Caddy health endpoint. Failure starts
+automatic recovery, and every restore checkpoint survives an updater restart.
+After three recovery failures the job enters maintenance and may expose only
+`restart` through `POST /_dirextalk/updater/v1/jobs/{job_id}/restart` with the
+job bearer. Manual rollback is never exposed; internal automatic recovery is
+retained. No infrastructure parameters are accepted by these routes.
 
 The resident process also monitors the fixed Compose project through Docker
 failure events and a 30-second reconciliation loop. Recovery is allowed only

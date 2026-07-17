@@ -51,6 +51,61 @@ func TestComposeRuntimePreparesAndCommitsCompleteRecoveryPoint(t *testing.T) {
 	})
 }
 
+func TestComposeRuntimeResolvesCentralDirectTagToOnePinnedDigest(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{}
+	runtime := newTestComposeRuntime(paths, runner)
+
+	release, err := runtime.ResolveDirectRelease(context.Background(), "v1.0.3")
+	if err != nil {
+		t.Fatalf("resolve direct release: %v", err)
+	}
+	if release.Version != "v1.0.3" || release.ImageDigest != "sha256:"+strings.Repeat("a", 64) || release.ImageRef() != AllowedImageRepository+":v1.0.3@"+release.ImageDigest {
+		t.Fatalf("unexpected immutable direct release: %#v", release)
+	}
+	assertCallSequence(t, runner.calls, []string{
+		"docker pull dirextalk/message-server:v1.0.3",
+		"docker image inspect --format {{join .RepoDigests",
+	})
+	if !strings.Contains(strings.Join(runner.calls, "\n"), "dirextalk/message-server:v1.0.3") {
+		t.Fatalf("direct tag was not inspected: %#v", runner.calls)
+	}
+}
+
+func TestDirectRepositoryDigestRejectsAmbiguousOrForeignResults(t *testing.T) {
+	t.Parallel()
+	for _, repoDigests := range []string{
+		"",
+		"other/repository@sha256:" + strings.Repeat("a", 64),
+		AllowedImageRepository + "@sha256:" + strings.Repeat("a", 64) + "\n" + AllowedImageRepository + "@sha256:" + strings.Repeat("b", 64),
+	} {
+		if _, err := directRepositoryDigest(repoDigests); err == nil {
+			t.Fatalf("invalid repository digests were accepted: %q", repoDigests)
+		}
+	}
+}
+
+func TestComposeRuntimePreparesDirectBackupWithoutReleaseIndex(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{}
+	runtime := newTestComposeRuntime(paths, runner)
+	target := DirectRelease{Version: "v1.0.3", ImageDigest: "sha256:" + strings.Repeat("a", 64)}
+	metadata, err := runtime.PrepareDirectBackup(context.Background(), Job{ID: "job_direct_backup", CurrentVersion: "v1.0.0", TargetVersion: target.Version}, target, ignoreProgress)
+	if err != nil {
+		t.Fatalf("prepare direct backup: %v", err)
+	}
+	if metadata.Version != "v1.0.0" || metadata.ImageDigest != "sha256:"+strings.Repeat("1", 64) || metadata.LegacyBootstrapAssumption {
+		t.Fatalf("unexpected direct recovery metadata: %#v", metadata)
+	}
+	for _, call := range runner.calls {
+		if strings.Contains(call, "github") || strings.Contains(call, "release-index") {
+			t.Fatalf("direct backup queried release discovery: %#v", runner.calls)
+		}
+	}
+}
+
 func TestComposeRuntimeRejectsUntrustedSourceDigestBeforeStoppingOrRotatingBackup(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

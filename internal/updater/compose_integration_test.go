@@ -104,6 +104,30 @@ func TestUbuntuComposeBackupUpgradeAndRollback(t *testing.T) {
 	}
 	verifyFixtureRestored(t, ctx, runtime)
 
+	directTarget, err := runtime.ResolveDirectRelease(ctx, "v1.0.3")
+	if err != nil {
+		t.Fatalf("resolve direct target: %v", err)
+	}
+	directJob := Job{ID: "job_direct_integration", CurrentVersion: "v1.0.0", TargetVersion: directTarget.Version}
+	directRecovery, err := runtime.PrepareDirectBackup(ctx, directJob, directTarget, ignoreProgress)
+	if err != nil {
+		t.Fatalf("real Compose direct backup: %v", err)
+	}
+	mutateFixtureState(t, ctx, runtime)
+	if err := runtime.ActivateDirectTarget(ctx, directTarget, ignoreProgress); err != nil {
+		t.Fatalf("real Compose direct activation: %v", err)
+	}
+	if err := runtime.CheckDirectTarget(ctx, directTarget); err != nil {
+		t.Fatalf("real Compose direct target health: %v", err)
+	}
+	if err := runtime.RestoreBackup(ctx, directRecovery); err != nil {
+		t.Fatalf("real Compose direct automatic-recovery primitive: %v", err)
+	}
+	if err := runtime.CheckRestored(ctx, directRecovery); err != nil {
+		t.Fatalf("real Compose direct restored health: %v", err)
+	}
+	verifyFixtureRestored(t, ctx, runtime)
+
 	store, jobID := seedQueuedExecutionJob(t)
 	failTargetHealth := true
 	runtime.publicHealth = func(ctx context.Context, _ string) (runtimeHealth, error) {
@@ -230,6 +254,14 @@ func (runner *integrationCommandRunner) Run(ctx context.Context, stdin io.Reader
 	}
 	if name == "docker" && len(args) >= 2 && args[0] == "image" && args[1] == "inspect" && strings.Contains(joined, ".RepoDigests") {
 		ref := args[len(args)-1]
+		if strings.HasPrefix(ref, AllowedImageRepository+":") && !strings.Contains(ref, "@") {
+			version := strings.TrimPrefix(ref, AllowedImageRepository+":")
+			if _, err := parseCanonicalVersion("image version", version); err != nil {
+				return err
+			}
+			_, err := io.WriteString(stdout, AllowedImageRepository+"@sha256:"+strings.Repeat("a", 64)+"\n")
+			return err
+		}
 		_, digest, err := parsePinnedImageRef(ref)
 		if err != nil {
 			return err
@@ -326,7 +358,7 @@ volumes:
 func assertFixtureMessageServerStopped(t *testing.T, ctx context.Context, runner hostCommandRunner) {
 	t.Helper()
 	var status bytes.Buffer
-	if err := runner.Run(ctx, nil, &status, "docker", "inspect", "--format", "{{.State.Status}}", composeContainerName("message-server")); err != nil {
+	if err := runner.Run(ctx, nil, &status, "docker", "inspect", "--format", "{{.State.Status}}", composeContainerName(ComposeProjectStandard, "message-server")); err != nil {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(status.String()) != "exited" {

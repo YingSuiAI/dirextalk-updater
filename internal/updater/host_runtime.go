@@ -161,6 +161,72 @@ func (runtime *ComposeRuntime) Recover(ctx context.Context) error {
 	return runtime.backups.Recover(ctx)
 }
 
+// CurrentVersion reads only the pinned local image reference. It never asks a
+// registry or GitHub for release metadata.
+func (runtime *ComposeRuntime) CurrentVersion(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
+	if err != nil {
+		return "", err
+	}
+	version, _, err := parsePinnedImageRef(imageRef)
+	if err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+// ResolveDirectRelease deliberately pulls the centrally requested tag once,
+// resolves the repository digest, and returns only an immutable fixed-repo
+// target. Callers cannot select an image repository or digest.
+func (runtime *ComposeRuntime) ResolveDirectRelease(ctx context.Context, targetVersion string) (DirectRelease, error) {
+	if _, err := parseCanonicalVersion("target_version", targetVersion); err != nil {
+		return DirectRelease{}, err
+	}
+	tagRef := AllowedImageRepository + ":" + targetVersion
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", "pull", tagRef); err != nil {
+		return DirectRelease{}, fmt.Errorf("pull requested message-server tag: %w", err)
+	}
+	repoDigests, err := runtime.commandOutput(ctx, "docker", "image", "inspect", "--format", "{{join .RepoDigests \"\\n\"}}", tagRef)
+	if err != nil {
+		return DirectRelease{}, err
+	}
+	digest, err := directRepositoryDigest(repoDigests)
+	if err != nil {
+		return DirectRelease{}, err
+	}
+	release := DirectRelease{Version: targetVersion, ImageDigest: digest}
+	if err := release.Validate(); err != nil {
+		return DirectRelease{}, err
+	}
+	return release, nil
+}
+
+func directRepositoryDigest(repoDigests string) (string, error) {
+	prefix := AllowedImageRepository + "@"
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(repoDigests, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		digest := strings.TrimPrefix(line, prefix)
+		if !digestPattern.MatchString(digest) {
+			return "", fmt.Errorf("resolved image digest is invalid")
+		}
+		seen[digest] = struct{}{}
+	}
+	if len(seen) != 1 {
+		return "", fmt.Errorf("requested image tag did not resolve to one allowed repository digest")
+	}
+	for digest := range seen {
+		return digest, nil
+	}
+	return "", fmt.Errorf("requested image tag has no allowed repository digest")
+}
+
 func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan Plan, progress func(JobStatus) error) (metadata BackupMetadata, returnErr error) {
 	ctx, cancel := context.WithTimeout(ctx, backupTimeout)
 	defer cancel()
@@ -267,6 +333,107 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 	return metadata, nil
 }
 
+// PrepareDirectBackup keeps the same durable recovery boundary as legacy
+// plans, but validates only the installed pinned image and health. Central
+// direct upgrades intentionally have no GitHub release-index source digest.
+func (runtime *ComposeRuntime) PrepareDirectBackup(ctx context.Context, job Job, target DirectRelease, progress func(JobStatus) error) (metadata BackupMetadata, returnErr error) {
+	ctx, cancel := context.WithTimeout(ctx, backupTimeout)
+	defer cancel()
+	if job.ID == "" || job.CurrentVersion == "" || job.TargetVersion != target.Version {
+		return BackupMetadata{}, fmt.Errorf("job and direct target do not match")
+	}
+	if err := target.Validate(); err != nil {
+		return BackupMetadata{}, err
+	}
+	if progress == nil {
+		return BackupMetadata{}, fmt.Errorf("backup progress callback is required")
+	}
+	if err := progress(JobValidating); err != nil {
+		return BackupMetadata{}, err
+	}
+	sourceVersion, sourceDigest, health, err := runtime.ensureDirectSourceReady(ctx, job.CurrentVersion)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	if err := progress(JobBackingUp); err != nil {
+		return BackupMetadata{}, err
+	}
+	staging, err := runtime.backups.Begin(ctx, job.ID)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	stagingOwned := true
+	defer func() {
+		if stagingOwned {
+			returnErr = errors.Join(returnErr, runtime.backups.Discard(staging))
+		}
+	}()
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("stop", "message-server")...); err != nil {
+		return BackupMetadata{}, serviceUnavailableError{cause: fmt.Errorf("stop source message-server for backup: %w", err)}
+	}
+	backupErr := func() error {
+		if err := runtime.writeCommandFile(ctx, filepath.Join(staging, "postgres.dump"), nil,
+			runtime.composeArgs("exec", "-T", "postgres", "pg_dump", "-U", "dirextalk_message_server", "-d", "dirextalk_message_server", "-Fc")...); err != nil {
+			return err
+		}
+		dump, err := os.Open(filepath.Join(staging, "postgres.dump"))
+		if err != nil {
+			return fmt.Errorf("open staged PostgreSQL dump: %w", err)
+		}
+		err = runtime.runner.Run(ctx, dump, io.Discard, "docker", runtime.composeArgs("exec", "-T", "postgres", "pg_restore", "--list")...)
+		closeErr := dump.Close()
+		if err != nil || closeErr != nil {
+			return errors.Join(fmt.Errorf("validate PostgreSQL dump: %w", err), closeErr)
+		}
+		if err := runtime.writeCommandFile(ctx, filepath.Join(staging, "message-config.tar"), nil,
+			runtime.composeArgs("run", "--rm", "--no-deps", "--entrypoint", "tar", "message-server", "-C", "/etc/dirextalk-message-server", "-cf", "-", ".")...); err != nil {
+			return err
+		}
+		if err := runtime.writeCommandFile(ctx, filepath.Join(staging, "message-data.tar"), nil,
+			runtime.composeArgs("run", "--rm", "--no-deps", "--entrypoint", "tar", "message-server", "-C", "/var/dirextalk-message-server", "--exclude=./p2p", "-cf", "-", ".")...); err != nil {
+			return err
+		}
+		return archiveDirectory(runtime.paths.p2pDir, filepath.Join(staging, "p2p.tar"))
+	}()
+	_, _, _, restartErr := runtime.ensureDirectSourceReady(ctx, job.CurrentVersion)
+	if restartErr != nil {
+		return BackupMetadata{}, serviceUnavailableError{cause: errors.Join(backupErr, fmt.Errorf("restore source message-server after backup: %w", restartErr))}
+	}
+	if backupErr != nil {
+		return BackupMetadata{}, backupErr
+	}
+	metadata = BackupMetadata{
+		SchemaVersion:       BackupMetadataSchemaVersion,
+		JobID:               job.ID,
+		Version:             sourceVersion,
+		ImageDigest:         sourceDigest,
+		ImageRef:            pinnedImageRef(sourceVersion, sourceDigest),
+		DatabaseSchema:      health.SchemaVersion,
+		SchemaCompatVersion: health.SchemaCompatVersion,
+		CreatedAt:           runtime.paths.now().UTC(),
+	}
+	for _, name := range requiredBackupArtifacts {
+		path := filepath.Join(staging, name)
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return BackupMetadata{}, fmt.Errorf("inspect staged artifact %s: %w", name, statErr)
+		}
+		digest, hashErr := fileSHA256(path)
+		if hashErr != nil {
+			return BackupMetadata{}, hashErr
+		}
+		metadata.Artifacts = append(metadata.Artifacts, BackupArtifact{Name: name, Size: info.Size(), SHA256: digest})
+	}
+	if err := WriteBackupMetadata(staging, metadata); err != nil {
+		return BackupMetadata{}, err
+	}
+	if err := runtime.backups.Commit(ctx, staging); err != nil {
+		return BackupMetadata{}, err
+	}
+	stagingOwned = false
+	return metadata, nil
+}
+
 func (runtime *ComposeRuntime) ActivateTarget(ctx context.Context, manifest Manifest, progress func(JobStatus) error) error {
 	ctx, cancel := context.WithTimeout(ctx, mutationTimeout)
 	defer cancel()
@@ -303,6 +470,47 @@ func (runtime *ComposeRuntime) ActivateTarget(ctx context.Context, manifest Mani
 
 func (runtime *ComposeRuntime) CheckTarget(ctx context.Context, manifest Manifest) error {
 	return runtime.waitExpected(ctx, manifest.Version, manifest.ImageDigest, manifest.SchemaVersion, manifest.SchemaCompatVersion)
+}
+
+func (runtime *ComposeRuntime) ActivateDirectTarget(ctx context.Context, target DirectRelease, progress func(JobStatus) error) error {
+	ctx, cancel := context.WithTimeout(ctx, mutationTimeout)
+	defer cancel()
+	if err := target.Validate(); err != nil {
+		return hostMutationError{cause: err}
+	}
+	if progress == nil {
+		return hostMutationError{cause: fmt.Errorf("activation progress callback is required")}
+	}
+	if err := progress(JobPulling); err != nil {
+		return hostMutationError{cause: err}
+	}
+	targetRef := target.ImageRef()
+	if err := runtime.pullVerifiedImage(ctx, targetRef, target.ImageDigest); err != nil {
+		return hostMutationError{cause: err}
+	}
+	if err := progress(JobStopping); err != nil {
+		return hostMutationError{cause: err}
+	}
+	if err := writePinnedImage(runtime.paths.envFile, targetRef, os.Rename, syncDirectory); err != nil {
+		return hostMutationError{cause: err, mutated: true}
+	}
+	if err := progress(JobMigrating); err != nil {
+		return hostMutationError{cause: err, mutated: true}
+	}
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--force-recreate", "message-server")...); err != nil {
+		return hostMutationError{cause: fmt.Errorf("recreate target message-server: %w", err), mutated: true}
+	}
+	if err := progress(JobStarting); err != nil {
+		return hostMutationError{cause: err, mutated: true}
+	}
+	return nil
+}
+
+func (runtime *ComposeRuntime) CheckDirectTarget(ctx context.Context, target DirectRelease) error {
+	if err := target.Validate(); err != nil {
+		return err
+	}
+	return runtime.waitCurrentExpected(ctx, target.Version, target.ImageDigest)
 }
 
 func (runtime *ComposeRuntime) RestoreBackup(ctx context.Context, recovery BackupMetadata) error {
@@ -579,6 +787,43 @@ func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVe
 	return "", "", runtimeHealth{}, serviceUnavailableError{cause: fmt.Errorf("source service did not recover: %w", lastErr)}
 }
 
+// ensureDirectSourceReady verifies the installed fixed-repository image and
+// health before it is backed up. Unlike a legacy plan it does not claim source
+// provenance from an absent release index.
+func (runtime *ComposeRuntime) ensureDirectSourceReady(ctx context.Context, expectedVersion string) (string, string, runtimeHealth, error) {
+	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
+	if err != nil {
+		return "", "", runtimeHealth{}, err
+	}
+	version, digest, err := parsePinnedImageRef(imageRef)
+	if err != nil || version != expectedVersion {
+		return "", "", runtimeHealth{}, fmt.Errorf("pinned source image does not match the direct job version")
+	}
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "message-server")...); err != nil {
+		return "", "", runtimeHealth{}, serviceUnavailableError{cause: fmt.Errorf("start source message-server: %w", err)}
+	}
+	consecutive := 0
+	var lastErr error
+	var health runtimeHealth
+	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
+		health, lastErr = runtime.checkCurrentHealth(ctx, version, digest)
+		if lastErr == nil {
+			consecutive++
+			if consecutive >= runtime.paths.healthConsecutive {
+				return version, digest, health, nil
+			}
+		} else {
+			consecutive = 0
+		}
+		if attempt+1 < runtime.paths.healthAttempts {
+			if err := runtime.paths.sleep(ctx, runtime.paths.healthInterval); err != nil {
+				return "", "", runtimeHealth{}, serviceUnavailableError{cause: err}
+			}
+		}
+	}
+	return "", "", runtimeHealth{}, serviceUnavailableError{cause: fmt.Errorf("source service did not recover: %w", lastErr)}
+}
+
 type runtimeHealth struct {
 	Status              string `json:"status"`
 	Version             string `json:"version"`
@@ -657,6 +902,33 @@ func (runtime *ComposeRuntime) inspectHealth(ctx context.Context) (runtimeHealth
 
 func (runtime *ComposeRuntime) waitExpected(ctx context.Context, version, digest string, schemaVersion, schemaCompatVersion int) error {
 	return runtime.waitExpectedWithMode(ctx, version, digest, schemaVersion, schemaCompatVersion, healthValidationStrict)
+}
+
+// waitCurrentExpected is the direct-target health gate. The direct protocol
+// cannot predeclare a schema, so it confirms the exact image/version and the
+// complete health contract rather than inventing a schema assertion.
+func (runtime *ComposeRuntime) waitCurrentExpected(ctx context.Context, version, digest string) error {
+	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+	defer cancel()
+	consecutive := 0
+	var lastErr error
+	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
+		lastErr = runtime.checkCurrentOnce(ctx, version, digest)
+		if lastErr == nil {
+			consecutive++
+			if consecutive >= runtime.paths.healthConsecutive {
+				return nil
+			}
+		} else {
+			consecutive = 0
+		}
+		if attempt+1 < runtime.paths.healthAttempts {
+			if err := runtime.paths.sleep(ctx, runtime.paths.healthInterval); err != nil {
+				return err
+			}
+		}
+	}
+	return fmt.Errorf("direct release did not pass the confirmation window: %w", lastErr)
 }
 
 func (runtime *ComposeRuntime) waitExpectedWithMode(ctx context.Context, version, digest string, schemaVersion, schemaCompatVersion int, mode healthValidationMode) error {

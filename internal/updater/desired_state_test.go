@@ -70,7 +70,7 @@ func TestControlDesiredStateReservesUpgradingForJobLifecycle(t *testing.T) {
 
 func TestControlDesiredStateRejectsEveryOverrideDuringActiveJob(t *testing.T) {
 	service, _ := newTestService(t)
-	apply := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"active-job","confirm":"apply_release_change"}`, testControlToken, "")
+	apply := postJSON(t, service.Handler(), controlJobsPath, directJobRequest("v1.0.3", "8e4d8444-2b3d-4f8f-8503-910f58b5b1df"), testControlToken, "")
 	if apply.Code != http.StatusAccepted {
 		t.Fatalf("create active job: %d %s", apply.Code, apply.Body.String())
 	}

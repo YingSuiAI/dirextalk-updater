@@ -14,6 +14,9 @@ func TestLoadControlTokenRequiresPrivatePermissions(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("a", 32)), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := LoadControlToken(path); err == nil {
 		t.Fatal("expected public control token file rejection")
 	}

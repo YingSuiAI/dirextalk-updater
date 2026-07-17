@@ -259,7 +259,7 @@ func TestJobEngineCompletesManualRollbackWithoutInventingAnError(t *testing.T) {
 	}
 }
 
-func TestJobEngineStopsAutomaticRollbackAfterThreeFailuresAndOffersManualRecovery(t *testing.T) {
+func TestJobEngineStopsAutomaticRollbackAfterThreeFailuresAndOffersRestartOnly(t *testing.T) {
 	t.Parallel()
 	store, jobID := seedQueuedExecutionJob(t)
 	runtime := &fakeUpgradeRuntime{
@@ -280,8 +280,8 @@ func TestJobEngineStopsAutomaticRollbackAfterThreeFailuresAndOffersManualRecover
 	if job.Status != JobFailed || job.RecoveryAttempts != maxRecoveryAttempts || job.ServiceAvailable || state.DesiredState != DesiredMaintenance {
 		t.Fatalf("automatic rollback did not fail closed: %#v / %q", job, state.DesiredState)
 	}
-	if want := []JobOperation{{Kind: "rollback"}, {Kind: "restart"}}; !reflect.DeepEqual(publicJobOperations(job), want) {
-		t.Fatalf("manual recovery operations = %#v, want %#v", publicJobOperations(job), want)
+	if want := []JobOperation{{Kind: "restart"}}; !reflect.DeepEqual(publicJobOperations(job), want) {
+		t.Fatalf("recovery operations = %#v, want %#v", publicJobOperations(job), want)
 	}
 }
 
@@ -362,12 +362,12 @@ func TestPublicJobOnlyOffersRecoveryOperationsSupportedByPersistedState(t *testi
 		RecoveryPoint:    &BackupMetadata{},
 	}
 	operations := publicJobOperations(withBackup)
-	if want := []JobOperation{{Kind: "rollback"}, {Kind: "restart"}}; !reflect.DeepEqual(operations, want) {
+	if want := []JobOperation{{Kind: "restart"}}; !reflect.DeepEqual(operations, want) {
 		t.Fatalf("operations = %#v, want %#v", operations, want)
 	}
 	succeeded := Job{Status: JobSucceeded, ServiceAvailable: true, RecoveryPoint: &BackupMetadata{}}
-	if want := []JobOperation{{Kind: "rollback"}}; !reflect.DeepEqual(publicJobOperations(succeeded), want) {
-		t.Fatalf("successful upgrade did not retain one-step rollback: %#v", publicJobOperations(succeeded))
+	if operations := publicJobOperations(succeeded); len(operations) != 0 {
+		t.Fatalf("successful upgrade exposed a manual rollback: %#v", operations)
 	}
 }
 
@@ -458,6 +458,46 @@ func TestJobEngineCompletesPersistedRestartOperation(t *testing.T) {
 	}
 }
 
+func TestJobEngineCompletesSingleHopDirectTargetWithoutPlan(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedDirectExecutionJob(t)
+	runtime := &fakeUpgradeRuntime{}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err != nil {
+		t.Fatalf("complete direct upgrade: %v", err)
+	}
+	if want := []string{"prepare_direct_backup", "activate_direct_target", "check_direct_target"}; !reflect.DeepEqual(runtime.calls, want) {
+		t.Fatalf("direct runtime calls = %#v, want %#v", runtime.calls, want)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := state.Jobs[jobID]
+	if len(state.Plans) != 0 || job.Status != JobSucceeded || job.CurrentVersion != "v1.0.3" || job.CurrentHop != 1 || job.DirectRelease == nil {
+		t.Fatalf("direct job did not complete as a single immutable hop: state=%#v job=%#v", state, job)
+	}
+}
+
+func TestJobEngineDirectTargetAutomaticallyRestoresOnHealthFailure(t *testing.T) {
+	t.Parallel()
+	store, jobID := seedQueuedDirectExecutionJob(t)
+	runtime := &fakeUpgradeRuntime{checkTargetErr: errors.New("unhealthy")}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err == nil {
+		t.Fatal("expected direct target health failure")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := state.Jobs[jobID]
+	if job.Status != JobRolledBack || job.CurrentVersion != "v1.0.0" || !job.ServiceAvailable || state.DesiredState != DesiredRunning {
+		t.Fatalf("direct target did not automatically restore: %#v / %q", job, state.DesiredState)
+	}
+	if operations := publicJobOperations(job); len(operations) != 0 {
+		t.Fatalf("rolled-back direct job exposed manual rollback: %#v", operations)
+	}
+}
+
 type fakeUpgradeRuntime struct {
 	calls             []string
 	phases            []JobStatus
@@ -509,6 +549,39 @@ func (runtime *fakeUpgradeRuntime) PrepareBackup(_ context.Context, job Job, _ P
 	}, nil
 }
 
+func (runtime *fakeUpgradeRuntime) PrepareDirectBackup(_ context.Context, job Job, target DirectRelease, progress func(JobStatus) error) (BackupMetadata, error) {
+	runtime.calls = append(runtime.calls, "prepare_direct_backup")
+	if job.TargetVersion != target.Version {
+		return BackupMetadata{}, errors.New("target mismatch")
+	}
+	if err := progress(JobValidating); err != nil {
+		return BackupMetadata{}, err
+	}
+	if err := progress(JobBackingUp); err != nil {
+		return BackupMetadata{}, err
+	}
+	if runtime.prepareErr != nil {
+		return BackupMetadata{}, runtime.prepareErr
+	}
+	digest := "sha256:" + strings.Repeat("1", 64)
+	return BackupMetadata{
+		SchemaVersion:       BackupMetadataSchemaVersion,
+		JobID:               job.ID,
+		Version:             job.CurrentVersion,
+		ImageDigest:         digest,
+		ImageRef:            AllowedImageRepository + ":" + job.CurrentVersion + "@" + digest,
+		DatabaseSchema:      1,
+		SchemaCompatVersion: 1,
+		CreatedAt:           time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+		Artifacts: []BackupArtifact{
+			{Name: "message-config.tar", Size: 1, SHA256: strings.Repeat("a", 64)},
+			{Name: "message-data.tar", Size: 1, SHA256: strings.Repeat("b", 64)},
+			{Name: "p2p.tar", Size: 1, SHA256: strings.Repeat("c", 64)},
+			{Name: "postgres.dump", Size: 1, SHA256: strings.Repeat("d", 64)},
+		},
+	}, nil
+}
+
 func (runtime *fakeUpgradeRuntime) ActivateTarget(_ context.Context, manifest Manifest, progress func(JobStatus) error) error {
 	runtime.calls = append(runtime.calls, "activate_target")
 	runtime.targetVersions = append(runtime.targetVersions, manifest.Version)
@@ -532,6 +605,28 @@ func (runtime *fakeUpgradeRuntime) CheckTarget(_ context.Context, manifest Manif
 	if runtime.checkTargetErrors != nil && runtime.checkTargetErrors[manifest.Version] != nil {
 		return runtime.checkTargetErrors[manifest.Version]
 	}
+	return runtime.checkTargetErr
+}
+
+func (runtime *fakeUpgradeRuntime) ActivateDirectTarget(_ context.Context, target DirectRelease, progress func(JobStatus) error) error {
+	runtime.calls = append(runtime.calls, "activate_direct_target")
+	runtime.targetVersions = append(runtime.targetVersions, target.Version)
+	if runtime.activateErr != nil && !runtime.activateMutated {
+		return runtime.activateErr
+	}
+	for _, phase := range []JobStatus{JobPulling, JobStopping, JobMigrating, JobStarting} {
+		if err := progress(phase); err != nil {
+			return err
+		}
+	}
+	if runtime.activateErr != nil {
+		return hostMutationError{cause: runtime.activateErr, mutated: true}
+	}
+	return nil
+}
+
+func (runtime *fakeUpgradeRuntime) CheckDirectTarget(_ context.Context, _ DirectRelease) error {
+	runtime.calls = append(runtime.calls, "check_direct_target")
 	return runtime.checkTargetErr
 }
 
@@ -586,6 +681,36 @@ func seedQueuedExecutionJob(t *testing.T) (*StateStore, string) {
 		UpdatedAt:         time.Now().UTC(),
 	}
 	state.Idempotency["execution-test"] = jobID
+	state.DesiredState = DesiredUpgrading
+	if err := store.Save(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	return store, jobID
+}
+
+func seedQueuedDirectExecutionJob(t *testing.T) (*StateStore, string) {
+	t.Helper()
+	store := NewStateStore(t.TempDir() + "/runtime.json")
+	state := NewRuntimeState()
+	jobID := "job_direct_execution"
+	target := DirectRelease{Version: "v1.0.3", ImageDigest: "sha256:" + strings.Repeat("a", 64)}
+	state.Jobs[jobID] = Job{
+		ID:                jobID,
+		Status:            JobQueued,
+		DirectRelease:     &target,
+		BearerTokenHashes: []string{strings.Repeat("c", 64)},
+		IdempotencyKey:    "direct-execution-test",
+		CurrentVersion:    "v1.0.0",
+		TargetVersion:     target.Version,
+		CurrentStep:       JobStepValidate,
+		TotalSteps:        executionTotalSteps,
+		TotalHops:         1,
+		ServiceAvailable:  true,
+		LastSafeVersion:   "v1.0.0",
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
+	}
+	state.Idempotency["direct-execution-test"] = jobID
 	state.DesiredState = DesiredUpgrading
 	if err := store.Save(context.Background(), state); err != nil {
 		t.Fatal(err)

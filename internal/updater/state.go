@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const RuntimeStateSchemaVersion = 5
+const RuntimeStateSchemaVersion = 6
 
 type DesiredState string
 
@@ -126,8 +126,9 @@ const (
 type Job struct {
 	ID                string          `json:"id"`
 	Status            JobStatus       `json:"status"`
-	PlanTokenHash     string          `json:"plan_token_hash"`
-	ManifestDigest    string          `json:"manifest_digest"`
+	PlanTokenHash     string          `json:"plan_token_hash,omitempty"`
+	ManifestDigest    string          `json:"manifest_digest,omitempty"`
+	DirectRelease     *DirectRelease  `json:"direct_release,omitempty"`
 	BearerTokenHashes []string        `json:"bearer_token_hashes"`
 	IdempotencyKey    string          `json:"idempotency_key"`
 	CurrentVersion    string          `json:"current_version,omitempty"`
@@ -297,22 +298,39 @@ func (state *RuntimeState) normalizeAndValidate() error {
 		if !job.Status.valid() {
 			return fmt.Errorf("job %s status %q is invalid", jobID, job.Status)
 		}
-		if _, ok := state.Plans[job.PlanTokenHash]; !ok {
-			return fmt.Errorf("job %s references an unknown plan", jobID)
-		}
-		plan := state.Plans[job.PlanTokenHash]
-		if job.ManifestDigest != plan.ManifestDigest || job.TargetVersion != plan.Manifest.Version || job.TotalHops != len(plan.ReleaseChain) {
-			return fmt.Errorf("job %s target does not match its plan", jobID)
-		}
-		if job.CurrentHop < 0 || job.CurrentHop > len(plan.ReleaseChain) {
-			return fmt.Errorf("job %s current hop is invalid", jobID)
-		}
-		expectedCurrent := plan.CurrentVersion
-		if job.CurrentHop > 0 {
-			expectedCurrent = plan.ReleaseChain[job.CurrentHop-1].Manifest.Version
-		}
-		if job.CurrentVersion != expectedCurrent {
-			return fmt.Errorf("job %s current version does not match its completed hop", jobID)
+		if job.DirectRelease != nil {
+			if err := job.DirectRelease.Validate(); err != nil {
+				return fmt.Errorf("job %s direct release is invalid: %w", jobID, err)
+			}
+			if job.PlanTokenHash != "" || job.ManifestDigest != "" {
+				return fmt.Errorf("job %s direct release must not reference a plan", jobID)
+			}
+			if job.TargetVersion != job.DirectRelease.Version || job.TotalHops != 1 || job.CurrentHop < 0 || job.CurrentHop > 1 {
+				return fmt.Errorf("job %s direct release progress is invalid", jobID)
+			}
+			current, currentErr := parseCanonicalVersion("current_version", job.CurrentVersion)
+			target, targetErr := parseCanonicalVersion("target_version", job.TargetVersion)
+			if currentErr != nil || targetErr != nil || current.GreaterThan(target) {
+				return fmt.Errorf("job %s direct release versions are invalid", jobID)
+			}
+		} else {
+			if _, ok := state.Plans[job.PlanTokenHash]; !ok {
+				return fmt.Errorf("job %s references an unknown plan", jobID)
+			}
+			plan := state.Plans[job.PlanTokenHash]
+			if job.ManifestDigest != plan.ManifestDigest || job.TargetVersion != plan.Manifest.Version || job.TotalHops != len(plan.ReleaseChain) {
+				return fmt.Errorf("job %s target does not match its plan", jobID)
+			}
+			if job.CurrentHop < 0 || job.CurrentHop > len(plan.ReleaseChain) {
+				return fmt.Errorf("job %s current hop is invalid", jobID)
+			}
+			expectedCurrent := plan.CurrentVersion
+			if job.CurrentHop > 0 {
+				expectedCurrent = plan.ReleaseChain[job.CurrentHop-1].Manifest.Version
+			}
+			if job.CurrentVersion != expectedCurrent {
+				return fmt.Errorf("job %s current version does not match its completed hop", jobID)
+			}
 		}
 		if job.IdempotencyKey == "" || state.Idempotency[job.IdempotencyKey] != jobID {
 			return fmt.Errorf("job %s idempotency mapping is invalid", jobID)
@@ -473,6 +491,24 @@ func migrateRuntimeState(state *RuntimeState) error {
 			state.Discovery.Status = DiscoveryStale
 			state.Discovery.ErrorCode = "release_index_refresh_required"
 		}
+		state.SchemaVersion = 5
+		fallthrough
+	case 5:
+		// Discovery and unconsumed plans are no longer executable. Keep plans
+		// referenced by persisted jobs so an interrupted legacy job can still
+		// finish its automatic recovery after the updater binary is replaced.
+		referencedPlans := make(map[string]struct{}, len(state.Jobs))
+		for _, job := range state.Jobs {
+			if job.PlanTokenHash != "" {
+				referencedPlans[job.PlanTokenHash] = struct{}{}
+			}
+		}
+		for planHash := range state.Plans {
+			if _, referenced := referencedPlans[planHash]; !referenced {
+				delete(state.Plans, planHash)
+			}
+		}
+		state.Discovery = DiscoveryCache{Status: DiscoveryUnknown}
 		state.SchemaVersion = RuntimeStateSchemaVersion
 		return nil
 	default:

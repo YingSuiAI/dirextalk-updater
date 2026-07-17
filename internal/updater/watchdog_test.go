@@ -161,8 +161,8 @@ func TestDesiredStateMutationCancelsInFlightWatchdogRepair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rejected := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"unknown-plan","idempotency_key":"rejected-during-repair","confirm":"apply_release_change"}`, testControlToken, "")
-	if rejected.Code != http.StatusConflict {
+	rejected := postJSON(t, service.Handler(), controlJobsPath, `{"target_version":"invalid","idempotency_key":"9e4d8444-2b3d-4f8f-8503-910f58b5b1df","confirm":"apply_release_change"}`, testControlToken, "")
+	if rejected.Code != http.StatusBadRequest {
 		t.Fatalf("invalid job request returned %d: %s", rejected.Code, rejected.Body.String())
 	}
 	select {
@@ -194,8 +194,8 @@ func TestDesiredStateMutationCancelsInFlightWatchdogRepair(t *testing.T) {
 func TestIdempotentJobReplayDoesNotCancelInFlightWatchdogRepair(t *testing.T) {
 	t.Parallel()
 	initialService, store := newTestService(t)
-	const idempotencyKey = "watchdog-idempotent-replay"
-	first := postJSON(t, initialService.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"`+idempotencyKey+`","confirm":"apply_release_change"}`, testControlToken, "")
+	const idempotencyKey = "ae4d8444-2b3d-4f8f-8503-910f58b5b1df"
+	first := postJSON(t, initialService.Handler(), controlJobsPath, directJobRequest("v1.0.3", idempotencyKey), testControlToken, "")
 	var firstTicket JobTicket
 	decodeResponse(t, first, &firstTicket)
 	if err := store.Update(context.Background(), func(state *RuntimeState) error {
@@ -226,11 +226,11 @@ func TestIdempotentJobReplayDoesNotCancelInFlightWatchdogRepair(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchdog repair did not start")
 	}
-	service, err := NewService(store, testControlToken, WithHostOperationGate(gate))
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(newTestDirectRuntime()), WithHostOperationGate(gate))
 	if err != nil {
 		t.Fatal(err)
 	}
-	replay := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"`+idempotencyKey+`","confirm":"apply_release_change"}`, testControlToken, "")
+	replay := postJSON(t, service.Handler(), controlJobsPath, directJobRequest("v1.0.3", idempotencyKey), testControlToken, "")
 	var replayTicket JobTicket
 	decodeResponse(t, replay, &replayTicket)
 	if replayTicket.JobID != firstTicket.JobID {
@@ -281,11 +281,11 @@ func TestUpgradeJobCreationCancelsInFlightWatchdogRepair(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchdog repair did not start")
 	}
-	service, err := NewService(store, testControlToken, WithHostOperationGate(gate))
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(newTestDirectRuntime()), WithHostOperationGate(gate))
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := postJSON(t, service.Handler(), controlJobsPath, `{"plan_token":"test-plan-token","idempotency_key":"watchdog-gate-job","confirm":"apply_release_change"}`, testControlToken, "")
+	response := postJSON(t, service.Handler(), controlJobsPath, directJobRequest("v1.0.3", "be4d8444-2b3d-4f8f-8503-910f58b5b1df"), testControlToken, "")
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("upgrade job was not accepted after cancelling repair: %d %s", response.Code, response.Body.String())
 	}
