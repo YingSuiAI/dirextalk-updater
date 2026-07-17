@@ -67,7 +67,8 @@ The v1 Unix API prefix is `/_dirextalk/updater/v1/`. The root-owned control
 token is required for all control routes. `POST control/status` accepts only
 `{}` and reads the current server version from the host's pinned image. It
 returns `current_version`, `updater_ready`, desired state, any active job, and
-watchdog state.
+watchdog state. `direct_contract_version` is `2` only for the safe direct-job
+and replay contract described below.
 
 `POST control/jobs` accepts only this strict request shape:
 
@@ -75,23 +76,45 @@ watchdog state.
 {
   "target_version": "v1.0.3",
   "idempotency_key": "lowercase UUID",
+  "client_version": "v1.0.0",
   "confirm": "apply_release_change"
 }
 ```
 
 The target must be canonical `vX.Y.Z` and greater than the host's current
-version. The updater pulls only `dirextalk/message-server:<target_version>`,
-resolves exactly one repository digest, and atomically persists the
-digest-pinned target before the server is stopped. Every new job is a single
-hop. GitHub Release discovery, release-index freshness, plan tokens, and
-multi-hop selection are not part of the active control path.
+version. For every new key, the updater fetches the latest published stable
+message-server Release from its fixed GitHub repository, enforces bounded and
+allowlisted HTTPS asset redirects, verifies `release-index.json.sha256`, and
+strictly validates the canonical index and embedded manifest digests. It then
+requires one explicit source-version/digest to target-version edge, proves the
+host's pinned source digest and schema health, and checks the supplied client
+version against the target manifest. A mutable image tag is never an upgrade
+authority.
+
+The release workflow emits the canonical index only after exact retained-data
+attestations and their checksums have passed for every configured source
+digest. The published checksum-bound index is therefore the runtime,
+attestation-derived edge authority; the updater independently verifies that
+index, the selected manifest, and the observed source digest before accepting
+the edge. It atomically persists their digests and compatibility facts in a
+single-hop contract-v2 Plan before the server is stopped. Indirect paths are
+not silently converted into direct upgrades.
 Existing persisted legacy jobs retain their plans only so automatic recovery
-can finish after an updater replacement; no new GitHub-discovered plan can be
-created. The supported adopted `v0.15.2` source may enter the direct path only
-at its code-approved image digest; its explicit legacy health and recovery
-assumption is persisted in the backup metadata.
+can finish after an updater replacement; no new legacy GitHub-discovered plan
+can be created. Contract v2 creates its internal Plan only inside authenticated
+job creation; no discovery or plan-token API is exposed. The supported adopted
+`v0.15.2` source may enter the direct path only at its code-approved image
+digest; its explicit legacy health and recovery assumption is persisted in the
+backup metadata.
 The `upgrading` desired state is internal to the job transaction, and external
 desired-state changes are rejected while a job is active.
+
+`POST control/jobs/replay` accepts only `target_version` and
+`idempotency_key`. It atomically rotates a replacement job bearer for the same
+persisted active or terminal job. An unknown key returns HTTP 404 with
+`idempotency_not_found` and never creates a job; a key bound to another target
+returns HTTP 409. Replay does not depend on current Release availability or
+plan expiry.
 
 An accepted job persists its checkpoint before host mutation. The updater
 stops message-server briefly to create a consistent PostgreSQL custom dump,

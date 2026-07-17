@@ -49,7 +49,8 @@ go build -o dirextalk-updater ./cmd/dirextalk-updater
 限制权限、临时文件、fsync 和原子替换持久化。v1 Unix API 前缀固定为
 `/_dirextalk/updater/v1/`。`POST control/status` 只接受 `{}`，从宿主机固定镜像
 读取当前服务端版本，并返回 `current_version`、`updater_ready`、期望状态、活动
-任务和 watchdog 状态。
+任务和 watchdog 状态。只有支持下述安全直传与 replay 合约的版本才会返回
+`direct_contract_version: 2`。
 
 `POST control/jobs` 只接受如下严格结构：
 
@@ -57,16 +58,30 @@ go build -o dirextalk-updater ./cmd/dirextalk-updater
 {
   "target_version": "v1.0.3",
   "idempotency_key": "小写 UUID",
+  "client_version": "v1.0.0",
   "confirm": "apply_release_change"
 }
 ```
 
-目标必须是 canonical `vX.Y.Z` 且高于宿主机当前版本。updater 只会拉取
-`dirextalk/message-server:<target_version>`，解析唯一 repository digest，并在停止
-服务前原子持久化该 digest-pinned 目标。所有新任务均为单跳；GitHub Release
-发现、release-index freshness、plan token 与多跳选择不再属于活跃控制路径。
+目标必须是 canonical `vX.Y.Z` 且高于宿主机当前版本。每个新幂等键都会从固定
+GitHub 仓库获取最新正式稳定 Release，限制响应大小与 HTTPS 重定向目标，校验
+`release-index.json.sha256`，并严格验证 canonical index 及其中 manifest 的摘要。
+随后必须找到一条明确的“源版本+源 digest -> 目标版本”单跳边，核对宿主机当前
+固定镜像 digest、完整 schema 健康信息，以及调用方提供的客户端版本范围；可移动
+tag 不能作为升级信任根。
+
+message-server 发布工作流只有在每个源 digest 的 retained-data attestation 及其
+checksum 验证通过后才生成并发布 canonical index。因此，正式 Release 中受
+checksum 绑定的 index 是运行时的 attestation-derived 升级边权威；updater 仍会
+独立复核 index、目标 manifest 和实际源 digest，再把这些摘要及兼容性事实作为
+contract-v2 单跳 Plan 原子持久化。不会把间接路径悄悄转换为直连升级。
 `upgrading` 只允许由创建任务的内部事务设置；存在活动任务时，外部不能覆盖任何
 期望状态。
+
+`POST control/jobs/replay` 只接受 `target_version` 与 `idempotency_key`，并在单个
+原子状态事务中为同一已持久化 active 或 terminal job 轮换 replacement bearer。
+未知 key 返回 HTTP 404 与 `idempotency_not_found`，绝不创建任务；同 key 不同目标
+返回 HTTP 409。replay 不依赖当前 Release 可用性或 Plan 是否过期。
 配置文件同样必须由 root 所有、权限严格为 `0600`，且必须是非符号链接的普通
 文件。
 `caddy_mode` 仅允许固定枚举 `compose` 或 `systemd`，旧配置缺省为 `compose`；
@@ -75,9 +90,11 @@ systemd 模式只能操作固定的 `caddy.service`。该值只来自 root-owned
 `compose_project` 可省略，默认使用 `dirextalk-p2p`。另一个允许值仅为代码固定的
 `dirextalk-message-server` deployer 管理布局，供当前安装和兼容迁移使用；它只能由
 root 配置，控制 API 不能传入。
-已持久化的 legacy plan 仅保留给已有中断任务完成自动恢复；不会再创建新的
-GitHub-discovered plan。受支持的已采用 `v0.15.2` 源只有在匹配代码批准的固定镜像
-digest 时才能进入直升链路，其明确的 legacy health/恢复假设会写入备份元数据。
+已持久化的 legacy plan 仅保留给已有中断任务完成自动恢复。contract v2 只会在
+鉴权后的新任务创建流程内生成内部 Plan，不暴露 discovery 或 plan-token API。
+不会再创建新的 legacy GitHub-discovered plan。受支持的已采用 `v0.15.2` 源只有在
+匹配代码批准的固定镜像 digest 时才能进入直升链路，其明确的 legacy health/恢复
+假设会写入备份元数据。
 
 任务在执行任何宿主机变更前都会先持久化检查点。updater 会短暂停止
 message-server，生成一致的 PostgreSQL custom dump、message 配置/数据归档和

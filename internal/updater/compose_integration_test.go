@@ -104,30 +104,6 @@ func TestUbuntuComposeBackupUpgradeAndRollback(t *testing.T) {
 	}
 	verifyFixtureRestored(t, ctx, runtime)
 
-	directTarget, err := runtime.ResolveDirectRelease(ctx, "v1.0.3")
-	if err != nil {
-		t.Fatalf("resolve direct target: %v", err)
-	}
-	directJob := Job{ID: "job_direct_integration", CurrentVersion: "v1.0.0", TargetVersion: directTarget.Version}
-	directRecovery, err := runtime.PrepareDirectBackup(ctx, directJob, directTarget, ignoreProgress)
-	if err != nil {
-		t.Fatalf("real Compose direct backup: %v", err)
-	}
-	mutateFixtureState(t, ctx, runtime)
-	if err := runtime.ActivateDirectTarget(ctx, directTarget, ignoreProgress); err != nil {
-		t.Fatalf("real Compose direct activation: %v", err)
-	}
-	if err := runtime.CheckDirectTarget(ctx, directTarget); err != nil {
-		t.Fatalf("real Compose direct target health: %v", err)
-	}
-	if err := runtime.RestoreBackup(ctx, directRecovery); err != nil {
-		t.Fatalf("real Compose direct automatic-recovery primitive: %v", err)
-	}
-	if err := runtime.CheckRestored(ctx, directRecovery); err != nil {
-		t.Fatalf("real Compose direct restored health: %v", err)
-	}
-	verifyFixtureRestored(t, ctx, runtime)
-
 	store, jobID := seedQueuedExecutionJob(t)
 	failTargetHealth := true
 	runtime.publicHealth = func(ctx context.Context, _ string) (runtimeHealth, error) {

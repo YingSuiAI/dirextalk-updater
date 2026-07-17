@@ -57,12 +57,18 @@ type DiscoveryCache struct {
 }
 
 type Plan struct {
-	Manifest       Manifest      `json:"manifest"`
-	ManifestDigest string        `json:"manifest_digest"`
-	CurrentVersion string        `json:"current_version"`
-	ReleaseChain   []ReleaseStep `json:"release_chain,omitempty"`
-	LegacyUnbound  bool          `json:"legacy_unbound,omitempty"`
-	ExpiresAt      time.Time     `json:"expires_at"`
+	Manifest                  Manifest      `json:"manifest"`
+	ManifestDigest            string        `json:"manifest_digest"`
+	CurrentVersion            string        `json:"current_version"`
+	ReleaseChain              []ReleaseStep `json:"release_chain,omitempty"`
+	DirectContractVersion     int           `json:"direct_contract_version,omitempty"`
+	ReleaseIndexDigest        string        `json:"release_index_digest,omitempty"`
+	ClientVersion             string        `json:"client_version,omitempty"`
+	SourceImageDigest         string        `json:"source_image_digest,omitempty"`
+	SourceSchemaVersion       int           `json:"source_schema_version,omitempty"`
+	SourceSchemaCompatVersion int           `json:"source_schema_compat_version,omitempty"`
+	LegacyUnbound             bool          `json:"legacy_unbound,omitempty"`
+	ExpiresAt                 time.Time     `json:"expires_at"`
 }
 
 func validatePlanReleaseChain(plan Plan) error {
@@ -101,6 +107,33 @@ func validatePlanReleaseChain(plan Plan) error {
 	target := plan.ReleaseChain[len(plan.ReleaseChain)-1]
 	if !reflect.DeepEqual(target.Manifest, plan.Manifest) || target.ManifestDigest != plan.ManifestDigest {
 		return fmt.Errorf("legacy target fields do not match the final chain step")
+	}
+	if plan.DirectContractVersion == 0 {
+		return nil
+	}
+	if plan.DirectContractVersion != DirectContractVersion {
+		return fmt.Errorf("direct_contract_version %d is not supported", plan.DirectContractVersion)
+	}
+	if len(plan.ReleaseChain) != 1 {
+		return fmt.Errorf("direct contract requires exactly one release step")
+	}
+	if !digestPattern.MatchString(plan.ReleaseIndexDigest) {
+		return fmt.Errorf("direct contract release_index_digest is invalid")
+	}
+	if !digestPattern.MatchString(plan.SourceImageDigest) || !digestAllowed(plan.SourceImageDigest, plan.ReleaseChain[0].SourceImageDigests) {
+		return fmt.Errorf("direct contract source image digest is not bound to the release edge")
+	}
+	source := DirectSource{
+		Version:             plan.CurrentVersion,
+		ImageDigest:         plan.SourceImageDigest,
+		SchemaVersion:       plan.SourceSchemaVersion,
+		SchemaCompatVersion: plan.SourceSchemaCompatVersion,
+	}
+	if err := validateSchemaCompatibility(source, plan.Manifest); err != nil {
+		return fmt.Errorf("direct contract schema: %w", err)
+	}
+	if err := validateClientCompatibility(plan.ClientVersion, plan.Manifest); err != nil {
+		return fmt.Errorf("direct contract client: %w", err)
 	}
 	return nil
 }

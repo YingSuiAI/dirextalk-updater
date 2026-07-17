@@ -210,6 +210,40 @@ func compareUpgradeEdges(left, right UpgradeEdge) int {
 	return leftTo.Compare(rightTo)
 }
 
+// DirectUpgradeStep resolves only an explicitly published single-hop edge.
+// It never turns an indirect path into an implicit direct upgrade.
+func (index ReleaseIndex) DirectUpgradeStep(currentVersion, targetVersion string) (ReleaseStep, error) {
+	if err := index.Validate(); err != nil {
+		return ReleaseStep{}, err
+	}
+	current, err := parseCanonicalVersion("current_version", currentVersion)
+	if err != nil {
+		return ReleaseStep{}, err
+	}
+	target, err := parseCanonicalVersion("target_version", targetVersion)
+	if err != nil {
+		return ReleaseStep{}, err
+	}
+	if !current.LessThan(target) {
+		return ReleaseStep{}, fmt.Errorf("target version must be newer than current version")
+	}
+	for _, edge := range index.Edges {
+		if edge.FromVersion == currentVersion && edge.ToVersion == targetVersion {
+			return index.stepFor(edge)
+		}
+	}
+	return ReleaseStep{}, fmt.Errorf("direct upgrade edge is not published from %s to %s", currentVersion, targetVersion)
+}
+
+func (index ReleaseIndex) releaseForVersion(version string) (IndexedRelease, bool) {
+	for _, release := range index.Releases {
+		if release.Manifest.Version == version {
+			return release, true
+		}
+	}
+	return IndexedRelease{}, false
+}
+
 func (index ReleaseIndex) UpgradePath(currentVersion string) ([]ReleaseStep, error) {
 	current, err := parseCanonicalVersion("current_version", currentVersion)
 	if err != nil {

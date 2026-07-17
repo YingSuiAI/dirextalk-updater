@@ -21,12 +21,14 @@ import (
 const (
 	apiPrefix               = "/_dirextalk/updater/v1/"
 	controlJobsPath         = apiPrefix + "control/jobs"
+	controlJobsReplayPath   = controlJobsPath + "/replay"
 	controlStatusPath       = apiPrefix + "control/status"
 	controlDesiredStatePath = apiPrefix + "control/desired-state"
 	publicJobsPrefix        = apiPrefix + "jobs/"
 	controlTokenHeader      = "X-Dirextalk-Control-Token"
 	applyConfirmation       = "apply_release_change"
 	maxRequestBytes         = 64 * 1024
+	directPlanLifetime      = 15 * time.Minute
 )
 
 var canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -36,6 +38,7 @@ type Service struct {
 	controlTokenHash string
 	now              func() time.Time
 	directRuntime    DirectJobRuntime
+	releaseSource    ReleaseSource
 	jobEngine        *JobEngine
 	jobSignal        chan struct{}
 	logf             func(string, ...any)
@@ -44,11 +47,17 @@ type Service struct {
 
 type ServiceOption func(*Service)
 
-// WithDirectJobRuntime connects the fixed host runtime to the control plane.
-// Central direct upgrades never fetch or trust GitHub release metadata.
+// WithDirectJobRuntime connects host-owned source inspection to the control
+// plane. Target trust is supplied separately by the fixed ReleaseSource.
 func WithDirectJobRuntime(runtime DirectJobRuntime) ServiceOption {
 	return func(service *Service) {
 		service.directRuntime = runtime
+	}
+}
+
+func WithReleaseSource(source ReleaseSource) ServiceOption {
+	return func(service *Service) {
+		service.releaseSource = source
 	}
 }
 
@@ -137,6 +146,12 @@ func (service *Service) Handler() http.Handler {
 
 func (service *Service) serveHTTP(response http.ResponseWriter, request *http.Request) {
 	switch {
+	case request.URL.Path == controlJobsReplayPath:
+		if request.Method != http.MethodPost {
+			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		service.replayJobTicket(response, request)
 	case request.URL.Path == controlJobsPath:
 		if request.Method != http.MethodPost {
 			writeAPIError(response, http.StatusMethodNotAllowed, "method_not_allowed")
@@ -165,7 +180,13 @@ func (service *Service) serveHTTP(response http.ResponseWriter, request *http.Re
 type createJobRequest struct {
 	TargetVersion  string `json:"target_version"`
 	IdempotencyKey string `json:"idempotency_key"`
+	ClientVersion  string `json:"client_version"`
 	Confirm        string `json:"confirm"`
+}
+
+type replayJobRequest struct {
+	TargetVersion  string `json:"target_version"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 type JobTicket struct {
@@ -210,22 +231,22 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 	}
 	input.TargetVersion = strings.TrimSpace(input.TargetVersion)
 	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
-	if _, err := parseCanonicalVersion("target_version", input.TargetVersion); err != nil || !canonicalUUIDPattern.MatchString(input.IdempotencyKey) || input.Confirm != applyConfirmation {
+	clientVersion, clientErr := normalizeRequiredClientVersion(input.ClientVersion)
+	if _, err := parseCanonicalVersion("target_version", input.TargetVersion); err != nil || !canonicalUUIDPattern.MatchString(input.IdempotencyKey) || clientErr != nil || input.Confirm != applyConfirmation {
 		writeAPIError(response, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	if service.directRuntime == nil {
-		writeAPIError(response, http.StatusServiceUnavailable, "updater_not_ready")
-		return
-	}
-
 	snapshot, err := service.store.Load(request.Context())
 	if err != nil {
 		writeAPIError(response, http.StatusInternalServerError, "state_read_failed")
 		return
 	}
-	if existingID, exists := snapshot.Idempotency[input.IdempotencyKey]; exists {
-		service.replayDirectJob(response, request, existingID, input.TargetVersion)
+	if _, exists := snapshot.Idempotency[input.IdempotencyKey]; exists {
+		service.rotateJobTicket(response, request, replayJobRequest{TargetVersion: input.TargetVersion, IdempotencyKey: input.IdempotencyKey}, http.StatusAccepted)
+		return
+	}
+	if service.directRuntime == nil || service.releaseSource == nil {
+		writeAPIError(response, http.StatusServiceUnavailable, "updater_not_ready")
 		return
 	}
 	if rejection := preflightDirectJob(snapshot); rejection != nil {
@@ -255,38 +276,85 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		writeAPIError(response, http.StatusConflict, "target_not_newer")
 		return
 	}
-	directRelease, resolveErr := service.directRuntime.ResolveDirectRelease(request.Context(), input.TargetVersion)
-	if resolveErr != nil || directRelease.Validate() != nil || directRelease.Version != input.TargetVersion {
-		writeAPIError(response, http.StatusBadGateway, "target_resolution_failed")
+	indexData, resolveErr := service.releaseSource.Latest(request.Context())
+	if resolveErr != nil {
+		writeAPIError(response, http.StatusBadGateway, "release_resolution_failed")
 		return
 	}
+	index, indexErr := ValidateReleaseIndex(indexData)
+	if indexErr != nil {
+		writeAPIError(response, http.StatusBadGateway, "release_index_invalid")
+		return
+	}
+	step, edgeErr := index.DirectUpgradeStep(currentVersion, input.TargetVersion)
+	if edgeErr != nil {
+		writeAPIError(response, http.StatusConflict, "upgrade_edge_unsupported")
+		return
+	}
+	source, sourceErr := service.directRuntime.InspectDirectSource(request.Context(), currentVersion, step)
+	if sourceErr != nil {
+		writeAPIError(response, http.StatusServiceUnavailable, "source_verification_failed")
+		return
+	}
+	if source.Validate() != nil || source.Version != currentVersion || !digestAllowed(source.ImageDigest, step.SourceImageDigests) {
+		writeAPIError(response, http.StatusConflict, "source_image_digest_untrusted")
+		return
+	}
+	if indexedSource, formal := index.releaseForVersion(currentVersion); formal {
+		if indexedSource.Manifest.ImageDigest != source.ImageDigest || indexedSource.Manifest.SchemaVersion != source.SchemaVersion || indexedSource.Manifest.SchemaCompatVersion != source.SchemaCompatVersion {
+			writeAPIError(response, http.StatusConflict, "source_contract_mismatch")
+			return
+		}
+	}
+	if err := validateSchemaCompatibility(source, step.Manifest); err != nil {
+		writeAPIError(response, http.StatusConflict, "schema_incompatible")
+		return
+	}
+	if err := validateClientCompatibility(clientVersion, step.Manifest); err != nil {
+		writeAPIError(response, http.StatusConflict, "client_version_incompatible")
+		return
+	}
+	now := service.now().UTC()
+	plan := Plan{
+		Manifest:                  step.Manifest,
+		ManifestDigest:            step.ManifestDigest,
+		CurrentVersion:            currentVersion,
+		ReleaseChain:              []ReleaseStep{step},
+		DirectContractVersion:     DirectContractVersion,
+		ReleaseIndexDigest:        releaseIndexDigest(indexData),
+		ClientVersion:             clientVersion,
+		SourceImageDigest:         source.ImageDigest,
+		SourceSchemaVersion:       source.SchemaVersion,
+		SourceSchemaCompatVersion: source.SchemaCompatVersion,
+		ExpiresAt:                 now.Add(directPlanLifetime),
+	}
+	if err := validatePlanReleaseChain(plan); err != nil {
+		writeAPIError(response, http.StatusConflict, "release_contract_invalid")
+		return
+	}
+	rawPlanToken, tokenErr := randomToken(32)
+	if tokenErr != nil {
+		writeAPIError(response, http.StatusInternalServerError, "token_generation_failed")
+		return
+	}
+	planHash := tokenHash(rawPlanToken)
 
 	var ticket JobTicket
 	var rejection *mutationRejection
 	err = service.store.Update(request.Context(), func(state *RuntimeState) error {
-		if existingID, exists := state.Idempotency[input.IdempotencyKey]; exists {
-			job, jobExists := state.Jobs[existingID]
-			if !jobExists {
-				return rejectMutation(http.StatusInternalServerError, "state_inconsistent")
-			}
-			if job.DirectRelease == nil || job.TargetVersion != input.TargetVersion {
-				return rejectMutation(http.StatusConflict, "idempotency_conflict")
-			}
-			rawBearer, tokenErr := randomToken(32)
-			if tokenErr != nil {
-				return rejectMutation(http.StatusInternalServerError, "token_generation_failed")
-			}
-			job.BearerTokenHashes = append(job.BearerTokenHashes, tokenHash(rawBearer))
-			job.UpdatedAt = service.now().UTC()
-			state.Jobs[job.ID] = job
-			ticket = JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}
-			return nil
+		if _, exists := state.Idempotency[input.IdempotencyKey]; exists {
+			var rotateErr error
+			ticket, rotateErr = rotatePersistedJobTicket(state, input.IdempotencyKey, input.TargetVersion, service.now().UTC())
+			return rotateErr
 		}
 		if hasActiveJob(*state) {
 			return rejectMutation(http.StatusConflict, "operation_in_progress")
 		}
 		if state.DesiredState != DesiredRunning {
 			return rejectMutation(http.StatusConflict, "desired_state_not_running")
+		}
+		if _, exists := state.Plans[planHash]; exists {
+			return rejectMutation(http.StatusInternalServerError, "token_generation_failed")
 		}
 
 		jobIDToken, tokenErr := randomToken(18)
@@ -301,11 +369,12 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 		job := Job{
 			ID:                "job_" + jobIDToken,
 			Status:            JobQueued,
-			DirectRelease:     &directRelease,
+			PlanTokenHash:     planHash,
+			ManifestDigest:    plan.ManifestDigest,
 			BearerTokenHashes: []string{tokenHash(rawBearer)},
 			IdempotencyKey:    input.IdempotencyKey,
 			CurrentVersion:    currentVersion,
-			TargetVersion:     directRelease.Version,
+			TargetVersion:     plan.Manifest.Version,
 			CurrentStep:       JobStepValidate,
 			TotalSteps:        executionTotalSteps,
 			TotalHops:         1,
@@ -314,6 +383,7 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 			CreatedAt:         now,
 			UpdatedAt:         now,
 		}
+		state.Plans[planHash] = plan
 		state.Jobs[job.ID] = job
 		state.Idempotency[input.IdempotencyKey] = job.ID
 		state.DesiredState = DesiredUpgrading
@@ -333,26 +403,32 @@ func (service *Service) createJob(response http.ResponseWriter, request *http.Re
 	writeJSON(response, http.StatusAccepted, ticket)
 }
 
-func (service *Service) replayDirectJob(response http.ResponseWriter, request *http.Request, existingID, targetVersion string) {
+func (service *Service) replayJobTicket(response http.ResponseWriter, request *http.Request) {
+	if !service.controlAuthorized(request) {
+		writeAPIError(response, http.StatusUnauthorized, "control_token_required")
+		return
+	}
+	var input replayJobRequest
+	if err := decodeControlRequest(response, request, &input, "job replay request"); err != nil {
+		writeAPIError(response, http.StatusBadRequest, "invalid_request: "+err.Error())
+		return
+	}
+	input.TargetVersion = strings.TrimSpace(input.TargetVersion)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	if _, err := parseCanonicalVersion("target_version", input.TargetVersion); err != nil || !canonicalUUIDPattern.MatchString(input.IdempotencyKey) {
+		writeAPIError(response, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	service.rotateJobTicket(response, request, input, http.StatusOK)
+}
+
+func (service *Service) rotateJobTicket(response http.ResponseWriter, request *http.Request, input replayJobRequest, successStatus int) {
 	var ticket JobTicket
 	var rejection *mutationRejection
 	err := service.store.Update(request.Context(), func(state *RuntimeState) error {
-		job, exists := state.Jobs[existingID]
-		if !exists {
-			return rejectMutation(http.StatusInternalServerError, "state_inconsistent")
-		}
-		if job.DirectRelease == nil || job.TargetVersion != targetVersion {
-			return rejectMutation(http.StatusConflict, "idempotency_conflict")
-		}
-		rawBearer, tokenErr := randomToken(32)
-		if tokenErr != nil {
-			return rejectMutation(http.StatusInternalServerError, "token_generation_failed")
-		}
-		job.BearerTokenHashes = append(job.BearerTokenHashes, tokenHash(rawBearer))
-		job.UpdatedAt = service.now().UTC()
-		state.Jobs[job.ID] = job
-		ticket = JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}
-		return nil
+		var rotateErr error
+		ticket, rotateErr = rotatePersistedJobTicket(state, input.IdempotencyKey, input.TargetVersion, service.now().UTC())
+		return rotateErr
 	})
 	if err != nil {
 		if errors.As(err, &rejection) {
@@ -362,7 +438,29 @@ func (service *Service) replayDirectJob(response http.ResponseWriter, request *h
 		}
 		return
 	}
-	writeJSON(response, http.StatusAccepted, ticket)
+	writeJSON(response, successStatus, ticket)
+}
+
+func rotatePersistedJobTicket(state *RuntimeState, idempotencyKey, targetVersion string, now time.Time) (JobTicket, error) {
+	existingID, exists := state.Idempotency[idempotencyKey]
+	if !exists {
+		return JobTicket{}, rejectMutation(http.StatusNotFound, "idempotency_not_found")
+	}
+	job, exists := state.Jobs[existingID]
+	if !exists {
+		return JobTicket{}, rejectMutation(http.StatusInternalServerError, "state_inconsistent")
+	}
+	if job.TargetVersion != targetVersion {
+		return JobTicket{}, rejectMutation(http.StatusConflict, "idempotency_conflict")
+	}
+	rawBearer, err := randomToken(32)
+	if err != nil {
+		return JobTicket{}, rejectMutation(http.StatusInternalServerError, "token_generation_failed")
+	}
+	job.BearerTokenHashes = append(job.BearerTokenHashes, tokenHash(rawBearer))
+	job.UpdatedAt = now
+	state.Jobs[job.ID] = job
+	return JobTicket{JobID: job.ID, JobToken: rawBearer, StatusURL: publicJobPath(job.ID), Status: job.Status}, nil
 }
 
 func preflightDirectJob(state RuntimeState) *mutationRejection {

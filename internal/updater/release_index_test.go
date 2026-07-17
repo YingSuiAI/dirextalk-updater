@@ -142,6 +142,20 @@ func TestUpgradePathPrefersDirectEdgeAndRejectsAmbiguousIntermediatePaths(t *tes
 	}
 }
 
+func TestDirectUpgradeStepRequiresPublishedSingleHopEdge(t *testing.T) {
+	index, err := ValidateReleaseIndex([]byte(validReleaseIndexJSON(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := index.DirectUpgradeStep("v1.0.0", "v1.1.0")
+	if err != nil || step.Manifest.Version != "v1.1.0" || !reflect.DeepEqual(step.SourceImageDigests, []string{"sha256:" + strings.Repeat("0", 64)}) {
+		t.Fatalf("published direct edge was not resolved: step=%#v err=%v", step, err)
+	}
+	if _, err := index.DirectUpgradeStep("v1.0.0", "v1.2.0"); err == nil || !strings.Contains(err.Error(), "not published") {
+		t.Fatalf("indirect path was accepted as a direct edge: %v", err)
+	}
+}
+
 func TestUpgradePathRejectsUnsupportedEdge(t *testing.T) {
 	index, err := ValidateReleaseIndex([]byte(validReleaseIndexJSON(t)))
 	if err != nil {

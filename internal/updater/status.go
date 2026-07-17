@@ -18,12 +18,13 @@ type ActiveJobStatus struct {
 }
 
 type StatusResponse struct {
-	Available      bool               `json:"available"`
-	UpdaterReady   bool               `json:"updater_ready"`
-	CurrentVersion string             `json:"current_version"`
-	DesiredState   DesiredState       `json:"desired_state"`
-	ActiveJob      *ActiveJobStatus   `json:"active_job,omitempty"`
-	Watchdog       WatchdogStatusView `json:"watchdog"`
+	Available             bool               `json:"available"`
+	UpdaterReady          bool               `json:"updater_ready"`
+	DirectContractVersion int                `json:"direct_contract_version"`
+	CurrentVersion        string             `json:"current_version"`
+	DesiredState          DesiredState       `json:"desired_state"`
+	ActiveJob             *ActiveJobStatus   `json:"active_job,omitempty"`
+	Watchdog              WatchdogStatusView `json:"watchdog"`
 }
 
 type WatchdogStatusView struct {
@@ -63,10 +64,11 @@ func (service *Service) getStatus(response http.ResponseWriter, request *http.Re
 		return
 	}
 	status := StatusResponse{
-		Available:      true,
-		CurrentVersion: currentVersion,
-		DesiredState:   state.DesiredState,
-		Watchdog:       publicWatchdogStatus(state.Watchdog),
+		Available:             true,
+		DirectContractVersion: DirectContractVersion,
+		CurrentVersion:        currentVersion,
+		DesiredState:          state.DesiredState,
+		Watchdog:              publicWatchdogStatus(state.Watchdog),
 	}
 	for _, job := range state.Jobs {
 		if !job.Status.active() {
@@ -84,7 +86,7 @@ func (service *Service) getStatus(response http.ResponseWriter, request *http.Re
 			ServiceAvailable: job.ServiceAvailable,
 		}
 	}
-	status.UpdaterReady = status.ActiveJob == nil && state.DesiredState == DesiredRunning
+	status.UpdaterReady = service.releaseSource != nil && status.ActiveJob == nil && state.DesiredState == DesiredRunning
 	writeJSON(response, http.StatusOK, status)
 }
 
