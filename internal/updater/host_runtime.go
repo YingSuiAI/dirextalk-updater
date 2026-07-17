@@ -178,6 +178,82 @@ func (runtime *ComposeRuntime) CurrentVersion(ctx context.Context) (string, erro
 	return version, nil
 }
 
+// PinInitialLatest converts the deployer's one-time latest bootstrap image into
+// the immutable version+digest form required by all subsequent upgrade jobs.
+// It accepts no caller-selected repository, version, or digest.
+func (runtime *ComposeRuntime) PinInitialLatest(ctx context.Context) error {
+	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
+	if err != nil {
+		return err
+	}
+	if _, _, err := parsePinnedImageRef(imageRef); err == nil {
+		return nil
+	}
+	latestRef := AllowedImageRepository + ":latest"
+	if imageRef != latestRef {
+		return fmt.Errorf("initial image must be the allowed latest tag or an immutable pin")
+	}
+	var version, digest string
+	var observeErr error
+	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
+		version, digest, observeErr = runtime.observeInitialLatest(ctx, latestRef)
+		if observeErr == nil {
+			break
+		}
+		if attempt+1 < runtime.paths.healthAttempts {
+			if err := runtime.paths.sleep(ctx, runtime.paths.healthInterval); err != nil {
+				return err
+			}
+		}
+	}
+	if observeErr != nil {
+		return fmt.Errorf("initial message-server did not become pinnable: %w", observeErr)
+	}
+	pinned := pinnedImageRef(version, digest)
+	if err := writePinnedImage(runtime.paths.envFile, pinned, os.Rename, syncDirectory); err != nil {
+		return err
+	}
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--force-recreate", "message-server")...); err != nil {
+		return fmt.Errorf("recreate initially pinned message-server: %w", err)
+	}
+	return nil
+}
+
+func (runtime *ComposeRuntime) observeInitialLatest(ctx context.Context, latestRef string) (string, string, error) {
+	container := composeContainerName(runtime.paths.composeProject, "message-server")
+	containerState, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", container)
+	if err != nil || strings.TrimSpace(containerState) != "running healthy" {
+		return "", "", fmt.Errorf("initial message-server container is not running and Docker-healthy")
+	}
+	containerImageID, err := runtime.commandOutput(ctx, "docker", "inspect", "--format", "{{.Image}}", container)
+	if err != nil {
+		return "", "", err
+	}
+	latestImageID, err := runtime.commandOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", latestRef)
+	if err != nil || strings.TrimSpace(containerImageID) == "" || strings.TrimSpace(containerImageID) != strings.TrimSpace(latestImageID) {
+		return "", "", fmt.Errorf("running message-server does not match the pulled latest image")
+	}
+	repoDigests, err := runtime.commandOutput(ctx, "docker", "image", "inspect", "--format", "{{join .RepoDigests \"\\n\"}}", latestRef)
+	if err != nil {
+		return "", "", err
+	}
+	digest, err := directRepositoryDigest(repoDigests)
+	if err != nil {
+		return "", "", err
+	}
+	health, err := runtime.inspectHealth(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	if health.Status != "ok" || health.SchemaVersion < 1 || health.SchemaCompatVersion < 1 || health.SchemaCompatVersion > health.SchemaVersion {
+		return "", "", fmt.Errorf("initial message-server health is invalid")
+	}
+	if _, err := parseCanonicalVersion("initial image version", health.Version); err != nil {
+		return "", "", err
+	}
+	return health.Version, digest, nil
+}
+
 // ResolveDirectRelease deliberately pulls the centrally requested tag once,
 // resolves the repository digest, and returns only an immutable fixed-repo
 // target. Callers cannot select an image repository or digest.

@@ -34,6 +34,10 @@ func main() {
 		err = runServer(*configPath)
 	case "version":
 		err = writeVersion()
+	case "pin-initial-latest":
+		if err = updater.CheckSupportedHost(); err == nil {
+			err = pinInitialLatest()
+		}
 	default:
 		err = fmt.Errorf("unknown command %q", command)
 	}
@@ -41,6 +45,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "dirextalk-updater:", err)
 		os.Exit(1)
 	}
+}
+
+func pinInitialLatest() error {
+	runtime, err := updater.NewComposeRuntime(updater.CaddyModeCompose, updater.ComposeProjectStandard)
+	if err != nil {
+		return err
+	}
+	return runtime.PinInitialLatest(context.Background())
 }
 
 func writeVersion() error {

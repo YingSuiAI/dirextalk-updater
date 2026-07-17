@@ -73,6 +73,51 @@ func TestComposeRuntimeResolvesCentralDirectTagToOnePinnedDigest(t *testing.T) {
 	}
 }
 
+func TestComposeRuntimePinsInitialLatestToObservedVersionAndDigest(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+AllowedImageRepository+":latest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{imageRef: AllowedImageRepository + ":latest"}
+	runtime := newTestComposeRuntime(paths, runner)
+	if err := runtime.PinInitialLatest(context.Background()); err != nil {
+		t.Fatalf("pin initial latest: %v", err)
+	}
+	data, err := os.ReadFile(paths.envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "MESSAGE_SERVER_IMAGE=" + pinnedImageRef("v1.0.0", "sha256:"+strings.Repeat("a", 64))
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("initial image was not pinned: %s", data)
+	}
+	assertCallSequence(t, runner.calls, []string{
+		"{{.State.Status}}",
+		"{{.Image}}",
+		"{{.Id}}",
+		"{{join .RepoDigests",
+		"wget -qO-",
+		"up -d --no-deps --force-recreate message-server",
+	})
+}
+
+func TestComposeRuntimeWaitsForInitialLatestHealthBeforePinning(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	paths.healthAttempts = 2
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+AllowedImageRepository+":latest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{imageRef: AllowedImageRepository + ":latest", unhealthyAttempts: 1}
+	if err := newTestComposeRuntime(paths, runner).PinInitialLatest(context.Background()); err != nil {
+		t.Fatalf("pin initial latest after readiness delay: %v", err)
+	}
+	if calls := strings.Count(strings.Join(runner.calls, "\n"), "{{.State.Status}}"); calls != 2 {
+		t.Fatalf("health readiness attempts = %d, want 2", calls)
+	}
+}
+
 func TestDirectRepositoryDigestRejectsAmbiguousOrForeignResults(t *testing.T) {
 	t.Parallel()
 	for _, repoDigests := range []string{
@@ -665,12 +710,13 @@ func TestComposeRuntimeStreamsOnlyFixedProjectFailureEvents(t *testing.T) {
 }
 
 type fakeHostCommandRunner struct {
-	calls          []string
-	imageRef       string
-	healthJSON     string
-	failContains   string
-	serviceStopped bool
-	eventOutput    string
+	calls             []string
+	imageRef          string
+	healthJSON        string
+	failContains      string
+	serviceStopped    bool
+	eventOutput       string
+	unhealthyAttempts int
 }
 
 func (runner *fakeHostCommandRunner) Run(_ context.Context, stdin io.Reader, stdout io.Writer, name string, args ...string) error {
@@ -692,7 +738,14 @@ func (runner *fakeHostCommandRunner) Run(_ context.Context, stdin io.Reader, std
 	case name == "docker" && len(args) > 0 && args[0] == "events":
 		_, _ = io.WriteString(stdout, runner.eventOutput)
 	case strings.Contains(joined, "{{.State.Status}}"):
-		_, _ = io.WriteString(stdout, "running healthy\n")
+		if runner.unhealthyAttempts > 0 {
+			runner.unhealthyAttempts--
+			_, _ = io.WriteString(stdout, "running starting\n")
+		} else {
+			_, _ = io.WriteString(stdout, "running healthy\n")
+		}
+	case strings.Contains(joined, "{{.Image}}"), strings.Contains(joined, "{{.Id}}"):
+		_, _ = io.WriteString(stdout, "sha256:"+strings.Repeat("b", 64)+"\n")
 	case strings.Contains(joined, "{{.Config.Image}}"):
 		imageRef := runner.imageRef
 		if imageRef == "" {
