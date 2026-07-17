@@ -8,13 +8,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 )
 
 const (
-	testIndexURL    = "https://github.com/YingSuiAI/dirextalk-message-server/releases/download/v1.2.0/release-index.json"
-	testChecksumURL = "https://github.com/YingSuiAI/dirextalk-message-server/releases/download/v1.2.0/release-index.json.sha256"
+	testReleaseAssetBaseURL = "https://github.com/YingSuiAI/dirextalk-message-server/releases/download/"
+	testIndexURL            = testReleaseAssetBaseURL + "v1.2.0/release-index.json"
+	testChecksumURL         = testReleaseAssetBaseURL + "v1.2.0/release-index.json.sha256"
 )
 
 type staticReleaseTransport struct {
@@ -82,6 +84,53 @@ func TestGitHubReleaseSourceRejectsUntrustedOrInconsistentRelease(t *testing.T) 
 	}
 }
 
+func TestGitHubReleaseSourceRequiresCompleteFormalReleaseAssetSet(t *testing.T) {
+	indexData := validReleaseIndexJSON(t)
+	attestationName := testLatestAttestationName()
+	requiredAssets := []string{
+		manifestAssetName,
+		manifestChecksumAssetName,
+		attestationName,
+		attestationName + ".sha256",
+	}
+	for _, missing := range requiredAssets {
+		t.Run(missing, func(t *testing.T) {
+			release := formalReleaseJSONOmitting("v1.2.0", false, false, missing)
+			_, err := NewGitHubReleaseSource(releaseHTTPClient(indexData, release, "")).Resolve(context.Background())
+			if err == nil {
+				t.Fatalf("expected release without %s to be rejected", missing)
+			}
+			if !strings.Contains(err.Error(), missing) {
+				t.Fatalf("expected missing asset error for %s, got %v", missing, err)
+			}
+		})
+	}
+}
+
+func TestRequiredFormalReleaseAssetsCoversEveryTargetSourceIdentity(t *testing.T) {
+	firstDigest := "sha256:" + strings.Repeat("1", 64)
+	secondDigest := "sha256:" + strings.Repeat("2", 64)
+	ignoredDigest := "sha256:" + strings.Repeat("3", 64)
+	assets, err := requiredFormalReleaseAssets(ReleaseIndex{Edges: []UpgradeEdge{
+		{FromVersion: "v0.15.2", FromImageDigests: []string{firstDigest, secondDigest}, ToVersion: "v1.0.0"},
+		{FromVersion: "v1.0.0", FromImageDigests: []string{ignoredDigest}, ToVersion: "v1.1.0"},
+	}}, "v1.0.0")
+	if err != nil {
+		t.Fatalf("requiredFormalReleaseAssets: %v", err)
+	}
+	want := []string{
+		manifestAssetName,
+		manifestChecksumAssetName,
+		"release-attestation-0.15.2-" + strings.TrimPrefix(firstDigest, "sha256:") + ".json",
+		"release-attestation-0.15.2-" + strings.TrimPrefix(firstDigest, "sha256:") + ".json.sha256",
+		"release-attestation-0.15.2-" + strings.TrimPrefix(secondDigest, "sha256:") + ".json",
+		"release-attestation-0.15.2-" + strings.TrimPrefix(secondDigest, "sha256:") + ".json.sha256",
+	}
+	if !reflect.DeepEqual(assets, want) {
+		t.Fatalf("required assets mismatch:\n got: %v\nwant: %v", assets, want)
+	}
+}
+
 func TestGitHubReleaseSourceRedirectAllowlist(t *testing.T) {
 	tag := "v1.2.0"
 	allowed := []string{
@@ -131,13 +180,34 @@ func releaseHTTPClient(indexData, release, checksumBody string) *http.Client {
 }
 
 func formalReleaseJSON(tag string, draft, prerelease bool) string {
+	return formalReleaseJSONOmitting(tag, draft, prerelease, "")
+}
+
+func formalReleaseJSONOmitting(tag string, draft, prerelease bool, omitted string) string {
+	assets := []string{
+		manifestAssetName,
+		manifestChecksumAssetName,
+		indexAssetName,
+		checksumAssetName,
+		testLatestAttestationName(),
+		testLatestAttestationName() + ".sha256",
+	}
+	assetJSON := make([]string, 0, len(assets))
+	for _, name := range assets {
+		if name == omitted {
+			continue
+		}
+		assetURL := testReleaseAssetBaseURL + tag + "/" + name
+		assetJSON = append(assetJSON, fmt.Sprintf(`{"name":%q,"browser_download_url":%q}`, name, assetURL))
+	}
 	return fmt.Sprintf(`{
 		"tag_name": %q,
 		"draft": %t,
 		"prerelease": %t,
-		"assets": [
-			{"name":"release-index.json","browser_download_url":%q},
-			{"name":"release-index.json.sha256","browser_download_url":%q}
-		]
-	}`, tag, draft, prerelease, testIndexURL, testChecksumURL)
+		"assets": [%s]
+	}`, tag, draft, prerelease, strings.Join(assetJSON, ","))
+}
+
+func testLatestAttestationName() string {
+	return "release-attestation-1.1.0-" + strings.Repeat("a", 64) + ".json"
 }

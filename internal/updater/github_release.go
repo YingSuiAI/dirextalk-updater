@@ -15,12 +15,14 @@ import (
 )
 
 const (
-	GitHubLatestReleaseAPI = "https://api.github.com/repos/YingSuiAI/dirextalk-message-server/releases/latest"
-	indexAssetName         = "release-index.json"
-	checksumAssetName      = "release-index.json.sha256"
-	maxReleaseMetadataSize = 1024 * 1024
-	maxReleaseAssetSize    = 1024 * 1024
-	maxReleaseRedirects    = 5
+	GitHubLatestReleaseAPI    = "https://api.github.com/repos/YingSuiAI/dirextalk-message-server/releases/latest"
+	manifestAssetName         = "release-manifest.json"
+	manifestChecksumAssetName = "release-manifest.json.sha256"
+	indexAssetName            = "release-index.json"
+	checksumAssetName         = "release-index.json.sha256"
+	maxReleaseMetadataSize    = 1024 * 1024
+	maxReleaseAssetSize       = 1024 * 1024
+	maxReleaseRedirects       = 5
 )
 
 var checksumPattern = regexp.MustCompile(`^([0-9a-f]{64})  release-index\.json\n$`)
@@ -44,7 +46,8 @@ type GitHubReleaseSource struct {
 // message-server release workflow publishes this asset only after verifying an
 // exact retained-upgrade attestation (and its checksum) for every configured
 // source digest; the updater then independently verifies the published index
-// checksum, canonical encoding, manifest digests, and exact edge binding.
+// checksum, canonical encoding, manifest digests, exact edge binding, and the
+// presence of the complete manifest and target attestation asset set.
 
 func NewGitHubReleaseSource(client *http.Client) *GitHubReleaseSource {
 	if client == nil {
@@ -88,23 +91,17 @@ func (source *GitHubReleaseSource) Resolve(ctx context.Context) (ResolvedRelease
 	if _, err := parseCanonicalVersion("release tag", metadata.TagName); err != nil {
 		return ResolvedRelease{}, err
 	}
-	assetURLs := map[string]string{}
+	assetURLs := map[string][]string{}
 	for _, asset := range metadata.Assets {
-		if asset.Name != indexAssetName && asset.Name != checksumAssetName {
-			continue
-		}
-		if assetURLs[asset.Name] != "" {
-			return ResolvedRelease{}, fmt.Errorf("release contains duplicate %s assets", asset.Name)
-		}
-		if err := validateReleaseAssetURL(asset.URL, metadata.TagName, asset.Name); err != nil {
-			return ResolvedRelease{}, err
-		}
-		assetURLs[asset.Name] = asset.URL
+		assetURLs[asset.Name] = append(assetURLs[asset.Name], asset.URL)
 	}
-	indexURL := assetURLs[indexAssetName]
-	checksumURL := assetURLs[checksumAssetName]
-	if indexURL == "" || checksumURL == "" {
-		return ResolvedRelease{}, fmt.Errorf("formal release requires %s and %s assets", indexAssetName, checksumAssetName)
+	indexURL, err := requireFormalReleaseAsset(assetURLs, metadata.TagName, indexAssetName)
+	if err != nil {
+		return ResolvedRelease{}, err
+	}
+	checksumURL, err := requireFormalReleaseAsset(assetURLs, metadata.TagName, checksumAssetName)
+	if err != nil {
+		return ResolvedRelease{}, err
 	}
 	assetRedirect := func(candidate *url.URL) error {
 		return validateReleaseAssetRedirect(candidate, metadata.TagName)
@@ -133,6 +130,15 @@ func (source *GitHubReleaseSource) Resolve(ctx context.Context) (ResolvedRelease
 	if index.LatestVersion != metadata.TagName {
 		return ResolvedRelease{}, fmt.Errorf("release tag %s does not match index latest_version %s", metadata.TagName, index.LatestVersion)
 	}
+	requiredAssets, err := requiredFormalReleaseAssets(index, metadata.TagName)
+	if err != nil {
+		return ResolvedRelease{}, err
+	}
+	for _, name := range requiredAssets {
+		if _, err := requireFormalReleaseAsset(assetURLs, metadata.TagName, name); err != nil {
+			return ResolvedRelease{}, err
+		}
+	}
 	latest := index.Releases[len(index.Releases)-1]
 	return ResolvedRelease{
 		Source:         "github_release",
@@ -144,6 +150,41 @@ func (source *GitHubReleaseSource) Resolve(ctx context.Context) (ResolvedRelease
 		IndexDigest:    "sha256:" + indexHashHex,
 		indexData:      append([]byte(nil), indexData...),
 	}, nil
+}
+
+func requireFormalReleaseAsset(assetURLs map[string][]string, tag, name string) (string, error) {
+	urls := assetURLs[name]
+	if len(urls) == 0 {
+		return "", fmt.Errorf("formal release requires %s asset", name)
+	}
+	if len(urls) != 1 {
+		return "", fmt.Errorf("release contains duplicate %s assets", name)
+	}
+	if err := validateReleaseAssetURL(urls[0], tag, name); err != nil {
+		return "", err
+	}
+	return urls[0], nil
+}
+
+func requiredFormalReleaseAssets(index ReleaseIndex, targetVersion string) ([]string, error) {
+	assets := []string{manifestAssetName, manifestChecksumAssetName}
+	attestationCount := 0
+	for _, edge := range index.Edges {
+		if edge.ToVersion != targetVersion {
+			continue
+		}
+		fromVersion := strings.TrimPrefix(edge.FromVersion, "v")
+		for _, sourceDigest := range edge.FromImageDigests {
+			identity := strings.TrimPrefix(sourceDigest, "sha256:")
+			name := "release-attestation-" + fromVersion + "-" + identity + ".json"
+			assets = append(assets, name, name+".sha256")
+			attestationCount++
+		}
+	}
+	if attestationCount == 0 {
+		return nil, fmt.Errorf("formal release index declares no source attestations for %s", targetVersion)
+	}
+	return assets, nil
 }
 
 func (source *GitHubReleaseSource) get(ctx context.Context, requestURL string, maximum int64, validateRedirect func(*url.URL) error) ([]byte, error) {
