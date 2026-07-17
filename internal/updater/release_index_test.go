@@ -66,6 +66,17 @@ func testDiscoveryCache(t *testing.T, data []byte, status DiscoveryStatus, check
 	}
 }
 
+// mustUpgradePath remains a test helper for validating recovery of legacy
+// persisted jobs. It does not exercise or enable GitHub discovery.
+func mustUpgradePath(t *testing.T, index ReleaseIndex, current string) []ReleaseStep {
+	t.Helper()
+	path, err := index.UpgradePath(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestValidateReleaseIndexBindsEmbeddedManifestsAndBuildsUniquePath(t *testing.T) {
 	index, err := ValidateReleaseIndex([]byte(validReleaseIndexJSON(t)))
 	if err != nil {

@@ -32,13 +32,6 @@ func main() {
 			break
 		}
 		err = runServer(*configPath)
-	case "resolve-release":
-		err = resolveRelease()
-	case "trigger-discovery":
-		if err = updater.CheckSupportedHost(); err != nil {
-			break
-		}
-		err = triggerDiscovery(*configPath)
 	case "version":
 		err = writeVersion()
 	default:
@@ -76,7 +69,7 @@ func runServer(configPath string) error {
 	service, err := updater.NewService(
 		store,
 		controlToken,
-		updater.WithReleaseSource(updater.NewGitHubReleaseSource(&http.Client{Timeout: 30 * time.Second})),
+		updater.WithDirectJobRuntime(runtime),
 		updater.WithJobEngine(engine),
 		updater.WithHostOperationGate(hostGate),
 	)
@@ -115,24 +108,4 @@ func loadRuntimeConfig(configPath string) (updater.Config, string, error) {
 		return updater.Config{}, "", err
 	}
 	return config, controlToken, nil
-}
-
-func resolveRelease() error {
-	resolved, err := updater.NewGitHubReleaseSource(&http.Client{Timeout: 30 * time.Second}).Resolve(context.Background())
-	if err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(resolved)
-}
-
-func triggerDiscovery(configPath string) error {
-	config, controlToken, err := loadRuntimeConfig(configPath)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	return updater.TriggerDiscovery(ctx, config.SocketPath, controlToken)
 }

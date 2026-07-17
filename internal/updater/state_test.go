@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,7 +171,7 @@ func TestStateStoreMigratesSchemaOneQueuedJobCurrentVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load schema one state: %v", err)
 	}
-	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 5 {
+	if migrated.SchemaVersion != RuntimeStateSchemaVersion || RuntimeStateSchemaVersion != 6 {
 		t.Fatalf("state schema was not upgraded: %d", migrated.SchemaVersion)
 	}
 	if migrated.Watchdog.Status != WatchdogUnknown {
@@ -221,32 +223,89 @@ func TestStateStoreMigratesSchemaFourSucceededJobProgress(t *testing.T) {
 	}
 }
 
-func TestDiscoveryRefreshCachesValidReleaseAndRetainsItOnFailure(t *testing.T) {
-	now := time.Date(2026, 7, 10, 3, 0, 0, 0, time.UTC)
-	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
-	source := &fakeReleaseSource{data: []byte(validSingleReleaseIndexJSON(t))}
-	cache, err := RefreshDiscovery(context.Background(), store, source, now)
+func TestStateStoreMigratesLegacyActiveJobWithoutDiscoveryOrUnreferencedPlans(t *testing.T) {
+	index, err := ValidateReleaseIndex([]byte(validSingleReleaseIndexJSON(t)))
 	if err != nil {
-		t.Fatalf("refresh discovery: %v", err)
+		t.Fatal(err)
 	}
-	if cache.Status != DiscoveryFresh || cache.Manifest == nil || cache.ManifestDigest == "" {
-		t.Fatalf("unexpected discovery cache: %#v", cache)
+	chain := mustUpgradePath(t, index, "v1.0.0")
+	planHash := tokenHash("legacy-active-plan")
+	dropHash := tokenHash("unreferenced-plan")
+	target := chain[len(chain)-1]
+	now := time.Date(2026, 7, 17, 9, 0, 0, 0, time.UTC)
+	legacy := NewRuntimeState()
+	legacy.SchemaVersion = 5
+	legacy.DesiredState = DesiredUpgrading
+	legacy.Discovery = testDiscoveryCache(t, []byte(validSingleReleaseIndexJSON(t)), DiscoveryFresh, now)
+	legacy.Plans[planHash] = Plan{
+		Manifest: target.Manifest, ManifestDigest: target.ManifestDigest, CurrentVersion: "v1.0.0",
+		ReleaseChain: chain, ExpiresAt: now.Add(time.Hour),
 	}
-	source.err = context.DeadlineExceeded
-	stale, err := RefreshDiscovery(context.Background(), store, source, now.Add(time.Hour))
-	if err == nil {
-		t.Fatal("expected source failure")
+	legacy.Plans[dropHash] = legacy.Plans[planHash]
+	recovery := BackupMetadata{
+		SchemaVersion:       BackupMetadataSchemaVersion,
+		JobID:               "job_legacy",
+		Version:             "v1.0.0",
+		ImageDigest:         "sha256:" + strings.Repeat("1", 64),
+		ImageRef:            AllowedImageRepository + ":v1.0.0@sha256:" + strings.Repeat("1", 64),
+		DatabaseSchema:      1,
+		SchemaCompatVersion: 1,
+		CreatedAt:           now,
+		Artifacts: []BackupArtifact{
+			{Name: "message-config.tar", Size: 1, SHA256: strings.Repeat("a", 64)},
+			{Name: "message-data.tar", Size: 1, SHA256: strings.Repeat("b", 64)},
+			{Name: "p2p.tar", Size: 1, SHA256: strings.Repeat("c", 64)},
+			{Name: "postgres.dump", Size: 1, SHA256: strings.Repeat("d", 64)},
+		},
 	}
-	if stale.Status != DiscoveryStale || stale.Manifest == nil || stale.Manifest.Version != "v1.1.0" {
-		t.Fatalf("last good release must be retained as stale: %#v", stale)
+	legacy.Jobs["job_legacy"] = Job{
+		ID:                "job_legacy",
+		Status:            JobRollingBack,
+		PlanTokenHash:     planHash,
+		ManifestDigest:    target.ManifestDigest,
+		BearerTokenHashes: []string{tokenHash("legacy-job-token")},
+		IdempotencyKey:    "legacy-job-request",
+		CurrentVersion:    "v1.0.0",
+		TargetVersion:     target.Manifest.Version,
+		CurrentStep:       JobStepRestoreBackup,
+		TotalSteps:        executionTotalSteps,
+		TotalHops:         1,
+		ServiceAvailable:  false,
+		LastSafeVersion:   "v1.0.0",
+		RecoveryPoint:     &recovery,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
-}
+	legacy.Idempotency["legacy-job-request"] = "job_legacy"
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStateStore(filepath.Join(t.TempDir(), "runtime.json"))
+	if err := os.WriteFile(store.Path(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-type fakeReleaseSource struct {
-	data []byte
-	err  error
-}
+	migrated, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("migrate schema five state: %v", err)
+	}
+	job := migrated.Jobs["job_legacy"]
+	if migrated.SchemaVersion != RuntimeStateSchemaVersion || migrated.Discovery.Status != DiscoveryUnknown || migrated.Discovery.Manifest != nil || len(migrated.Plans) != 1 {
+		t.Fatalf("migration retained executable discovery data: %#v", migrated)
+	}
+	if _, exists := migrated.Plans[dropHash]; exists {
+		t.Fatalf("migration retained an unreferenced plan: %#v", migrated.Plans)
+	}
+	if _, exists := migrated.Plans[planHash]; !exists || job.BearerTokenHashes[0] != tokenHash("legacy-job-token") || !reflect.DeepEqual(job.RecoveryPoint, &recovery) {
+		t.Fatalf("migration did not preserve the active legacy job boundary: %#v", job)
+	}
 
-func (source *fakeReleaseSource) Latest(context.Context) ([]byte, error) {
-	return append([]byte(nil), source.data...), source.err
+	runtime := &fakeUpgradeRuntime{}
+	if err := NewJobEngine(store, runtime).RunActive(context.Background()); err != nil {
+		t.Fatalf("resume migrated legacy recovery: %v", err)
+	}
+	if want := []string{"restore_backup", "check_restored"}; !reflect.DeepEqual(runtime.calls, want) {
+		t.Fatalf("legacy recovery calls = %#v, want %#v", runtime.calls, want)
+	}
 }
