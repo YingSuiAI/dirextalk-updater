@@ -13,8 +13,9 @@ import (
 const SupportedReleaseIndexVersion = 1
 
 const (
-	legacyInitialVersion = "v0.15.2"
-	firstFormalVersion   = "v1.0.0"
+	legacyInitialVersion     = "v0.15.2"
+	legacyInitialImageDigest = "sha256:d57a0b7830f7248e29fe7c45c0848cb1167454709fd33effe07ff074415f571c"
+	firstFormalVersion       = "v1.0.0"
 )
 
 type IndexedRelease struct {

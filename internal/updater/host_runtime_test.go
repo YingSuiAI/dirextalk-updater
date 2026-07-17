@@ -118,6 +118,21 @@ func TestComposeRuntimeWaitsForInitialLatestHealthBeforePinning(t *testing.T) {
 	}
 }
 
+func TestComposeRuntimeReconcilesAnAlreadyPinnedBootstrap(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	runner := &fakeHostCommandRunner{}
+	if err := newTestComposeRuntime(paths, runner).PinInitialLatest(context.Background()); err != nil {
+		t.Fatalf("reconcile pinned bootstrap: %v", err)
+	}
+	assertCallSequence(t, runner.calls, []string{
+		"up -d --no-deps message-server",
+	})
+	if strings.Contains(strings.Join(runner.calls, "\n"), "--force-recreate") {
+		t.Fatalf("an already reconciled pin must not be forcibly recreated: %#v", runner.calls)
+	}
+}
+
 func TestDirectRepositoryDigestRejectsAmbiguousOrForeignResults(t *testing.T) {
 	t.Parallel()
 	for _, repoDigests := range []string{
@@ -148,6 +163,47 @@ func TestComposeRuntimePreparesDirectBackupWithoutReleaseIndex(t *testing.T) {
 		if strings.Contains(call, "github") || strings.Contains(call, "release-index") {
 			t.Fatalf("direct backup queried release discovery: %#v", runner.calls)
 		}
+	}
+}
+
+func TestComposeRuntimePreparesDirectBackupForApprovedLegacySource(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	paths := testHostPaths(t, root)
+	legacyDigest := "sha256:d57a0b7830f7248e29fe7c45c0848cb1167454709fd33effe07ff074415f571c"
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+pinnedImageRef(legacyInitialVersion, legacyDigest)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{
+		imageRef:   pinnedImageRef(legacyInitialVersion, legacyDigest),
+		healthJSON: `{"status":"ok"}`,
+	}
+	runtime := newTestComposeRuntime(paths, runner)
+	target := DirectRelease{Version: "v1.0.3", ImageDigest: "sha256:" + strings.Repeat("a", 64)}
+	metadata, err := runtime.PrepareDirectBackup(context.Background(), Job{ID: "job_direct_legacy", CurrentVersion: legacyInitialVersion, TargetVersion: target.Version}, target, ignoreProgress)
+	if err != nil {
+		t.Fatalf("prepare approved legacy direct backup: %v", err)
+	}
+	if !metadata.LegacyBootstrapAssumption || metadata.Version != legacyInitialVersion || metadata.ImageDigest != legacyDigest {
+		t.Fatalf("legacy direct recovery contract was not preserved: %#v", metadata)
+	}
+}
+
+func TestComposeRuntimeRejectsUnapprovedLegacyDigestBeforeDirectBackup(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	unapproved := "sha256:" + strings.Repeat("f", 64)
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+pinnedImageRef(legacyInitialVersion, unapproved)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{imageRef: pinnedImageRef(legacyInitialVersion, unapproved), healthJSON: `{"status":"ok"}`}
+	runtime := newTestComposeRuntime(paths, runner)
+	target := DirectRelease{Version: "v1.0.3", ImageDigest: "sha256:" + strings.Repeat("a", 64)}
+	if _, err := runtime.PrepareDirectBackup(context.Background(), Job{ID: "job_direct_legacy_unapproved", CurrentVersion: legacyInitialVersion, TargetVersion: target.Version}, target, ignoreProgress); err == nil {
+		t.Fatal("unapproved legacy digest was accepted for a direct backup")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("unapproved legacy digest reached host operations: %#v", runner.calls)
 	}
 }
 

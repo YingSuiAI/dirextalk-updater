@@ -59,8 +59,9 @@ must be a regular non-symlink file.
 default to `compose`. Systemd mode can operate only `caddy.service`. This mode
 comes only from the root-owned config and is never accepted by the API.
 `compose_project` is optional and defaults to `dirextalk-p2p`. The only other
-accepted value is the code-owned `dirextalk-message-server` legacy migration
-layout. It is root configuration, never a control-API input.
+accepted value is the code-owned `dirextalk-message-server` deployer-managed
+layout used by current installations and compatible migrations. It is root
+configuration, never a control-API input.
 
 The v1 Unix API prefix is `/_dirextalk/updater/v1/`. The root-owned control
 token is required for all control routes. `POST control/status` accepts only
@@ -86,7 +87,9 @@ hop. GitHub Release discovery, release-index freshness, plan tokens, and
 multi-hop selection are not part of the active control path.
 Existing persisted legacy jobs retain their plans only so automatic recovery
 can finish after an updater replacement; no new GitHub-discovered plan can be
-created.
+created. The supported adopted `v0.15.2` source may enter the direct path only
+at its code-approved image digest; its explicit legacy health and recovery
+assumption is persisted in the backup metadata.
 The `upgrading` desired state is internal to the job transaction, and external
 desired-state changes are rejected while a job is active.
 

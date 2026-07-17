@@ -36,7 +36,7 @@ func main() {
 		err = writeVersion()
 	case "pin-initial-latest":
 		if err = updater.CheckSupportedHost(); err == nil {
-			err = pinInitialLatest()
+			err = pinInitialLatest(*configPath)
 		}
 	default:
 		err = fmt.Errorf("unknown command %q", command)
@@ -47,12 +47,28 @@ func main() {
 	}
 }
 
-func pinInitialLatest() error {
-	runtime, err := updater.NewComposeRuntime(updater.CaddyModeCompose, updater.ComposeProjectStandard)
+type initialLatestPinner interface {
+	PinInitialLatest(context.Context) error
+}
+
+type initialLatestRuntimeFactory func(updater.CaddyMode, updater.ComposeProject) (initialLatestPinner, error)
+
+func pinInitialLatest(configPath string) error {
+	config, err := updater.LoadConfigFile(configPath)
 	if err != nil {
 		return err
 	}
-	return runtime.PinInitialLatest(context.Background())
+	return pinInitialLatestWithConfig(context.Background(), config, func(mode updater.CaddyMode, project updater.ComposeProject) (initialLatestPinner, error) {
+		return updater.NewComposeRuntime(mode, project)
+	})
+}
+
+func pinInitialLatestWithConfig(ctx context.Context, config updater.Config, factory initialLatestRuntimeFactory) error {
+	runtime, err := factory(config.CaddyMode, config.ComposeProject)
+	if err != nil {
+		return err
+	}
+	return runtime.PinInitialLatest(ctx)
 }
 
 func writeVersion() error {

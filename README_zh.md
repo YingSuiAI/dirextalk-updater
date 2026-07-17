@@ -73,9 +73,11 @@ go build -o dirextalk-updater ./cmd/dirextalk-updater
 systemd 模式只能操作固定的 `caddy.service`。该值只来自 root-owned 配置，API
 不能传入或覆盖。
 `compose_project` 可省略，默认使用 `dirextalk-p2p`。另一个允许值仅为代码固定的
-旧部署迁移布局 `dirextalk-message-server`；它只能由 root 配置，控制 API 不能传入。
+`dirextalk-message-server` deployer 管理布局，供当前安装和兼容迁移使用；它只能由
+root 配置，控制 API 不能传入。
 已持久化的 legacy plan 仅保留给已有中断任务完成自动恢复；不会再创建新的
-GitHub-discovered plan。
+GitHub-discovered plan。受支持的已采用 `v0.15.2` 源只有在匹配代码批准的固定镜像
+digest 时才能进入直升链路，其明确的 legacy health/恢复假设会写入备份元数据。
 
 任务在执行任何宿主机变更前都会先持久化检查点。updater 会短暂停止
 message-server，生成一致的 PostgreSQL custom dump、message 配置/数据归档和

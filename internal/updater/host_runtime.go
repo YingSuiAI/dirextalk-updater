@@ -187,6 +187,9 @@ func (runtime *ComposeRuntime) PinInitialLatest(ctx context.Context) error {
 		return err
 	}
 	if _, _, err := parsePinnedImageRef(imageRef); err == nil {
+		if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "message-server")...); err != nil {
+			return fmt.Errorf("reconcile initially pinned message-server: %w", err)
+		}
 		return nil
 	}
 	latestRef := AllowedImageRepository + ":latest"
@@ -479,14 +482,15 @@ func (runtime *ComposeRuntime) PrepareDirectBackup(ctx context.Context, job Job,
 		return BackupMetadata{}, backupErr
 	}
 	metadata = BackupMetadata{
-		SchemaVersion:       BackupMetadataSchemaVersion,
-		JobID:               job.ID,
-		Version:             sourceVersion,
-		ImageDigest:         sourceDigest,
-		ImageRef:            pinnedImageRef(sourceVersion, sourceDigest),
-		DatabaseSchema:      health.SchemaVersion,
-		SchemaCompatVersion: health.SchemaCompatVersion,
-		CreatedAt:           runtime.paths.now().UTC(),
+		SchemaVersion:             BackupMetadataSchemaVersion,
+		JobID:                     job.ID,
+		Version:                   sourceVersion,
+		ImageDigest:               sourceDigest,
+		ImageRef:                  pinnedImageRef(sourceVersion, sourceDigest),
+		DatabaseSchema:            health.SchemaVersion,
+		SchemaCompatVersion:       health.SchemaCompatVersion,
+		LegacyBootstrapAssumption: sourceVersion == legacyInitialVersion && sourceDigest == legacyInitialImageDigest,
+		CreatedAt:                 runtime.paths.now().UTC(),
 	}
 	for _, name := range requiredBackupArtifacts {
 		path := filepath.Join(staging, name)
@@ -875,6 +879,13 @@ func (runtime *ComposeRuntime) ensureDirectSourceReady(ctx context.Context, expe
 	if err != nil || version != expectedVersion {
 		return "", "", runtimeHealth{}, fmt.Errorf("pinned source image does not match the direct job version")
 	}
+	mode := healthValidationStrict
+	if version == legacyInitialVersion {
+		if digest != legacyInitialImageDigest {
+			return "", "", runtimeHealth{}, fmt.Errorf("legacy direct source image digest is not approved")
+		}
+		mode = healthValidationLegacyBootstrapSource
+	}
 	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "message-server")...); err != nil {
 		return "", "", runtimeHealth{}, serviceUnavailableError{cause: fmt.Errorf("start source message-server: %w", err)}
 	}
@@ -882,7 +893,7 @@ func (runtime *ComposeRuntime) ensureDirectSourceReady(ctx context.Context, expe
 	var lastErr error
 	var health runtimeHealth
 	for attempt := 0; attempt < runtime.paths.healthAttempts; attempt++ {
-		health, lastErr = runtime.checkCurrentHealth(ctx, version, digest)
+		health, lastErr = runtime.checkCurrentHealthWithMode(ctx, version, digest, mode)
 		if lastErr == nil {
 			consecutive++
 			if consecutive >= runtime.paths.healthConsecutive {
