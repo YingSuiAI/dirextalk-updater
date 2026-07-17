@@ -257,13 +257,29 @@ func (runtime *ComposeRuntime) observeInitialLatest(ctx context.Context, latestR
 	return health.Version, digest, nil
 }
 
-// InspectDirectSource proves the host source against the exact release edge.
-// Unlike tag resolution, this reads the pinned source digest and full health
-// contract and refuses a digest not authorized by the trusted index.
+// InspectDirectSource proves the host source against the exact release edge
+// without mutating or waiting for the service. Job creation runs through a
+// bounded synchronous control request, so the full consecutive-health recovery
+// gate remains in PrepareBackup immediately before any upgrade mutation.
 func (runtime *ComposeRuntime) InspectDirectSource(ctx context.Context, expectedVersion string, step ReleaseStep) (DirectSource, error) {
-	version, digest, health, err := runtime.ensureSourceReady(ctx, expectedVersion, step)
+	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
 	if err != nil {
 		return DirectSource{}, err
+	}
+	version, digest, err := parsePinnedImageRef(imageRef)
+	if err != nil || version != expectedVersion {
+		return DirectSource{}, fmt.Errorf("pinned source image does not match the planned version")
+	}
+	if !digestAllowed(digest, step.SourceImageDigests) {
+		return DirectSource{}, errUntrustedSourceImageDigest
+	}
+	mode := healthValidationStrict
+	if isTrustedLegacyBootstrapStep(expectedVersion, digest, step) {
+		mode = healthValidationLegacyBootstrapSource
+	}
+	health, err := runtime.checkCurrentHealthWithMode(ctx, version, digest, mode)
+	if err != nil {
+		return DirectSource{}, serviceUnavailableError{cause: fmt.Errorf("inspect source health: %w", err)}
 	}
 	source := DirectSource{
 		Version:             version,

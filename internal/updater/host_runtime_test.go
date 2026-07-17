@@ -54,6 +54,13 @@ func TestComposeRuntimePreparesAndCommitsCompleteRecoveryPoint(t *testing.T) {
 func TestComposeRuntimeInspectsPinnedSourceAgainstTrustedEdge(t *testing.T) {
 	t.Parallel()
 	paths := testHostPaths(t, t.TempDir())
+	paths.healthAttempts = 60
+	paths.healthConsecutive = 3
+	sleepCalls := 0
+	paths.sleep = func(context.Context, time.Duration) error {
+		sleepCalls++
+		return nil
+	}
 	runner := &fakeHostCommandRunner{}
 	runtime := newTestComposeRuntime(paths, runner)
 	manifest, err := ValidateManifest([]byte(validManifestJSON()))
@@ -68,10 +75,48 @@ func TestComposeRuntimeInspectsPinnedSourceAgainstTrustedEdge(t *testing.T) {
 	if source.Version != "v1.0.0" || source.ImageDigest != "sha256:"+strings.Repeat("1", 64) || source.SchemaVersion != 1 || source.SchemaCompatVersion != 1 {
 		t.Fatalf("unexpected pinned source proof: %#v", source)
 	}
+	if sleepCalls != 0 {
+		t.Fatalf("bounded source inspection waited for health retries %d times", sleepCalls)
+	}
 	for _, call := range runner.calls {
 		if strings.Contains(call, "docker pull "+AllowedImageRepository+":") {
 			t.Fatalf("source inspection trusted a mutable target tag: %#v", runner.calls)
 		}
+		if strings.Contains(call, " up -d") {
+			t.Fatalf("bounded source inspection mutated the Compose service: %#v", runner.calls)
+		}
+	}
+}
+
+func TestComposeRuntimeInspectDirectSourceFailsClosed(t *testing.T) {
+	t.Parallel()
+	manifest, err := ValidateManifest([]byte(validManifestJSON()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedDigest := "sha256:" + strings.Repeat("1", 64)
+	tests := []struct {
+		name       string
+		edgeDigest string
+		healthJSON string
+	}{
+		{name: "untrusted digest", edgeDigest: "sha256:" + strings.Repeat("2", 64)},
+		{name: "invalid schema", edgeDigest: trustedDigest, healthJSON: `{"status":"ok","version":"v1.0.0","schema_version":0,"schema_compat_version":0}`},
+		{name: "unhealthy", edgeDigest: trustedDigest, healthJSON: `{"status":"starting","version":"v1.0.0","schema_version":1,"schema_compat_version":1}`},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			paths := testHostPaths(t, t.TempDir())
+			runner := &fakeHostCommandRunner{healthJSON: testCase.healthJSON}
+			runtime := newTestComposeRuntime(paths, runner)
+			step := ReleaseStep{
+				Manifest: manifest, ManifestDigest: canonicalManifestDigest(manifest),
+				SourceImageDigests: []string{testCase.edgeDigest},
+			}
+			if _, err := runtime.InspectDirectSource(context.Background(), "v1.0.0", step); err == nil {
+				t.Fatal("unsafe direct source was accepted")
+			}
+		})
 	}
 }
 
