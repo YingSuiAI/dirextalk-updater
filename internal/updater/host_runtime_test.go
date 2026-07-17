@@ -51,25 +51,27 @@ func TestComposeRuntimePreparesAndCommitsCompleteRecoveryPoint(t *testing.T) {
 	})
 }
 
-func TestComposeRuntimeResolvesCentralDirectTagToOnePinnedDigest(t *testing.T) {
+func TestComposeRuntimeInspectsPinnedSourceAgainstTrustedEdge(t *testing.T) {
 	t.Parallel()
 	paths := testHostPaths(t, t.TempDir())
 	runner := &fakeHostCommandRunner{}
 	runtime := newTestComposeRuntime(paths, runner)
-
-	release, err := runtime.ResolveDirectRelease(context.Background(), "v1.0.3")
+	manifest, err := ValidateManifest([]byte(validManifestJSON()))
 	if err != nil {
-		t.Fatalf("resolve direct release: %v", err)
+		t.Fatal(err)
 	}
-	if release.Version != "v1.0.3" || release.ImageDigest != "sha256:"+strings.Repeat("a", 64) || release.ImageRef() != AllowedImageRepository+":v1.0.3@"+release.ImageDigest {
-		t.Fatalf("unexpected immutable direct release: %#v", release)
+	step := ReleaseStep{Manifest: manifest, ManifestDigest: canonicalManifestDigest(manifest), SourceImageDigests: []string{"sha256:" + strings.Repeat("1", 64)}}
+	source, err := runtime.InspectDirectSource(context.Background(), "v1.0.0", step)
+	if err != nil {
+		t.Fatalf("inspect direct source: %v", err)
 	}
-	assertCallSequence(t, runner.calls, []string{
-		"docker pull dirextalk/message-server:v1.0.3",
-		"docker image inspect --format {{join .RepoDigests",
-	})
-	if !strings.Contains(strings.Join(runner.calls, "\n"), "dirextalk/message-server:v1.0.3") {
-		t.Fatalf("direct tag was not inspected: %#v", runner.calls)
+	if source.Version != "v1.0.0" || source.ImageDigest != "sha256:"+strings.Repeat("1", 64) || source.SchemaVersion != 1 || source.SchemaCompatVersion != 1 {
+		t.Fatalf("unexpected pinned source proof: %#v", source)
+	}
+	for _, call := range runner.calls {
+		if strings.Contains(call, "docker pull "+AllowedImageRepository+":") {
+			t.Fatalf("source inspection trusted a mutable target tag: %#v", runner.calls)
+		}
 	}
 }
 

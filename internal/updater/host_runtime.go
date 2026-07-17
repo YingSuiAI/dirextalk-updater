@@ -257,32 +257,28 @@ func (runtime *ComposeRuntime) observeInitialLatest(ctx context.Context, latestR
 	return health.Version, digest, nil
 }
 
-// ResolveDirectRelease deliberately pulls the centrally requested tag once,
-// resolves the repository digest, and returns only an immutable fixed-repo
-// target. Callers cannot select an image repository or digest.
-func (runtime *ComposeRuntime) ResolveDirectRelease(ctx context.Context, targetVersion string) (DirectRelease, error) {
-	if _, err := parseCanonicalVersion("target_version", targetVersion); err != nil {
-		return DirectRelease{}, err
-	}
-	tagRef := AllowedImageRepository + ":" + targetVersion
-	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", "pull", tagRef); err != nil {
-		return DirectRelease{}, fmt.Errorf("pull requested message-server tag: %w", err)
-	}
-	repoDigests, err := runtime.commandOutput(ctx, "docker", "image", "inspect", "--format", "{{join .RepoDigests \"\\n\"}}", tagRef)
+// InspectDirectSource proves the host source against the exact release edge.
+// Unlike tag resolution, this reads the pinned source digest and full health
+// contract and refuses a digest not authorized by the trusted index.
+func (runtime *ComposeRuntime) InspectDirectSource(ctx context.Context, expectedVersion string, step ReleaseStep) (DirectSource, error) {
+	version, digest, health, err := runtime.ensureSourceReady(ctx, expectedVersion, step)
 	if err != nil {
-		return DirectRelease{}, err
+		return DirectSource{}, err
 	}
-	digest, err := directRepositoryDigest(repoDigests)
-	if err != nil {
-		return DirectRelease{}, err
+	source := DirectSource{
+		Version:             version,
+		ImageDigest:         digest,
+		SchemaVersion:       health.SchemaVersion,
+		SchemaCompatVersion: health.SchemaCompatVersion,
 	}
-	release := DirectRelease{Version: targetVersion, ImageDigest: digest}
-	if err := release.Validate(); err != nil {
-		return DirectRelease{}, err
+	if err := source.Validate(); err != nil {
+		return DirectSource{}, err
 	}
-	return release, nil
+	return source, nil
 }
 
+// directRepositoryDigest is used only while converting the deployer's
+// one-time allowed :latest bootstrap into an immutable pin.
 func directRepositoryDigest(repoDigests string) (string, error) {
 	prefix := AllowedImageRepository + "@"
 	seen := make(map[string]struct{})
@@ -331,6 +327,14 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 	}
 	if !digestAllowed(digest, step.SourceImageDigests) {
 		return BackupMetadata{}, errUntrustedSourceImageDigest
+	}
+	if err := validateSchemaCompatibility(DirectSource{
+		Version:             version,
+		ImageDigest:         digest,
+		SchemaVersion:       health.SchemaVersion,
+		SchemaCompatVersion: health.SchemaCompatVersion,
+	}, step.Manifest); err != nil {
+		return BackupMetadata{}, fmt.Errorf("source schema compatibility changed after job creation: %w", err)
 	}
 	if err := progress(JobBackingUp); err != nil {
 		return BackupMetadata{}, err
@@ -412,9 +416,9 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 	return metadata, nil
 }
 
-// PrepareDirectBackup keeps the same durable recovery boundary as legacy
-// plans, but validates only the installed pinned image and health. Central
-// direct upgrades intentionally have no GitHub release-index source digest.
+// PrepareDirectBackup is retained only for recovery compatibility with
+// pre-contract-v2 development jobs. Contract-v2 jobs use a release-index-bound
+// Plan and PrepareBackup instead.
 func (runtime *ComposeRuntime) PrepareDirectBackup(ctx context.Context, job Job, target DirectRelease, progress func(JobStatus) error) (metadata BackupMetadata, returnErr error) {
 	ctx, cancel := context.WithTimeout(ctx, backupTimeout)
 	defer cancel()
@@ -867,9 +871,8 @@ func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVe
 	return "", "", runtimeHealth{}, serviceUnavailableError{cause: fmt.Errorf("source service did not recover: %w", lastErr)}
 }
 
-// ensureDirectSourceReady verifies the installed fixed-repository image and
-// health before it is backed up. Unlike a legacy plan it does not claim source
-// provenance from an absent release index.
+// ensureDirectSourceReady is the legacy pre-contract-v2 source verifier. New
+// jobs use ensureSourceReady with the trusted release-index step.
 func (runtime *ComposeRuntime) ensureDirectSourceReady(ctx context.Context, expectedVersion string) (string, string, runtimeHealth, error) {
 	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
 	if err != nil {

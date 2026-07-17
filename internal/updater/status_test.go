@@ -24,7 +24,7 @@ func TestControlStatusReadsPinnedRuntimeAndExposesReadiness(t *testing.T) {
 	}
 	var status StatusResponse
 	decodeResponse(t, response, &status)
-	if !status.Available || !status.UpdaterReady || status.CurrentVersion != "v1.0.0" || status.DesiredState != DesiredRunning || status.ActiveJob != nil {
+	if !status.Available || !status.UpdaterReady || status.DirectContractVersion != DirectContractVersion || status.CurrentVersion != "v1.0.0" || status.DesiredState != DesiredRunning || status.ActiveJob != nil {
 		t.Fatalf("unexpected direct status: %#v", status)
 	}
 }
@@ -42,14 +42,28 @@ func TestControlStatusReportsActiveJobAsNotReady(t *testing.T) {
 	}
 }
 
+func TestControlStatusDoesNotReportReadyWithoutTrustedReleaseSource(t *testing.T) {
+	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(newTestDirectRuntime()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := postJSON(t, service.Handler(), controlStatusPath, `{}`, testControlToken, "")
+	var status StatusResponse
+	decodeResponse(t, response, &status)
+	if status.UpdaterReady || status.DirectContractVersion != DirectContractVersion {
+		t.Fatalf("missing trusted release source reported ready: %#v", status)
+	}
+}
+
 type unavailableDirectRuntime struct{}
 
 func (unavailableDirectRuntime) CurrentVersion(context.Context) (string, error) {
 	return "", errors.New("unavailable")
 }
 
-func (unavailableDirectRuntime) ResolveDirectRelease(context.Context, string) (DirectRelease, error) {
-	return DirectRelease{}, errors.New("unavailable")
+func (unavailableDirectRuntime) InspectDirectSource(context.Context, string, ReleaseStep) (DirectSource, error) {
+	return DirectSource{}, errors.New("unavailable")
 }
 
 func TestControlStatusFailsClosedWhenRuntimeVersionCannotBeRead(t *testing.T) {
