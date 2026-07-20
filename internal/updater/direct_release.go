@@ -5,31 +5,33 @@ import (
 	"fmt"
 )
 
-// DirectRelease is retained only so an already persisted job created by the
-// pre-contract-v2 development build can finish recovery. Contract v2 creates a
-// release-index-bound Plan instead of this standalone target.
+// DirectRelease is the centrally authorized target stored with a direct job.
+// ImageDigest is retained only to decode and finish older persisted jobs.
 type DirectRelease struct {
 	Version     string `json:"version"`
-	ImageDigest string `json:"image_digest"`
+	ImageDigest string `json:"image_digest,omitempty"`
 }
 
 func (release DirectRelease) Validate() error {
 	if _, err := parseCanonicalVersion("target_version", release.Version); err != nil {
 		return err
 	}
-	if !digestPattern.MatchString(release.ImageDigest) {
+	if release.ImageDigest != "" && !digestPattern.MatchString(release.ImageDigest) {
 		return fmt.Errorf("direct target image_digest is invalid")
 	}
 	return nil
 }
 
 func (release DirectRelease) ImageRef() string {
+	if release.ImageDigest == "" {
+		return taggedImageRef(release.Version)
+	}
 	return pinnedImageRef(release.Version, release.ImageDigest)
 }
 
-// DirectJobRuntime reads and proves host-owned source facts. The caller never
-// supplies an image reference, digest, schema, command, or path.
+// DirectJobRuntime reads the host-owned current version. Central authorization
+// supplies only a canonical target version; callers cannot select a repository,
+// image digest, command, or path.
 type DirectJobRuntime interface {
 	CurrentVersion(context.Context) (string, error)
-	InspectDirectSource(context.Context, string, ReleaseStep) (DirectSource, error)
 }

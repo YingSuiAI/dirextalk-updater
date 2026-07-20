@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// statusRequest is deliberately empty. The resident updater reads the pinned
-// host version itself; callers cannot claim a source version or schema.
+// statusRequest is deliberately empty. The resident updater reads the
+// configured host version itself; callers cannot claim a source version.
 type statusRequest struct{}
 
 type ActiveJobStatus struct {
@@ -86,7 +86,7 @@ func (service *Service) getStatus(response http.ResponseWriter, request *http.Re
 			ServiceAvailable: job.ServiceAvailable,
 		}
 	}
-	status.UpdaterReady = service.releaseSource != nil && status.ActiveJob == nil && state.DesiredState == DesiredRunning
+	status.UpdaterReady = status.ActiveJob == nil && state.DesiredState == DesiredRunning
 	writeJSON(response, http.StatusOK, status)
 }
 

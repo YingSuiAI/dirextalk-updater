@@ -226,7 +226,7 @@ func TestIdempotentJobReplayDoesNotCancelInFlightWatchdogRepair(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchdog repair did not start")
 	}
-	service, err := NewService(store, testControlToken, WithDirectJobRuntime(newTestDirectRuntime()), WithReleaseSource(&staticDirectReleaseSource{data: []byte(directTestReleaseIndexJSON(t))}), WithHostOperationGate(gate))
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(newTestDirectRuntime()), WithHostOperationGate(gate))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +281,7 @@ func TestUpgradeJobCreationCancelsInFlightWatchdogRepair(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("watchdog repair did not start")
 	}
-	service, err := NewService(store, testControlToken, WithDirectJobRuntime(newTestDirectRuntime()), WithReleaseSource(&staticDirectReleaseSource{data: []byte(directTestReleaseIndexJSON(t))}), WithHostOperationGate(gate))
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(newTestDirectRuntime()), WithHostOperationGate(gate))
 	if err != nil {
 		t.Fatal(err)
 	}

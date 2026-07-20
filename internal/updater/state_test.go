@@ -81,6 +81,25 @@ func TestRuntimeStateRejectsInvalidUpgradingAndActiveJobCombinations(t *testing.
 	}
 }
 
+func TestRuntimeStateStillReadsLegacyDigestBoundDirectJob(t *testing.T) {
+	store, jobID := seedQueuedDirectExecutionJob(t)
+	if err := store.Update(context.Background(), func(state *RuntimeState) error {
+		job := state.Jobs[jobID]
+		job.DirectRelease.ImageDigest = "sha256:" + strings.Repeat("a", 64)
+		state.Jobs[jobID] = job
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load legacy digest-bound direct job: %v", err)
+	}
+	if got := loaded.Jobs[jobID].DirectRelease; got == nil || got.ImageDigest != "sha256:"+strings.Repeat("a", 64) {
+		t.Fatalf("legacy direct target was not preserved: %#v", got)
+	}
+}
+
 func TestRuntimeStateRejectsInvalidPersistedPlanAndJobState(t *testing.T) {
 	manifest, err := ValidateManifest([]byte(validManifestJSON()))
 	if err != nil {

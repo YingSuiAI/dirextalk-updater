@@ -2,10 +2,10 @@
 
 Dirextalk Updater is a small host service that keeps server upgrade control
 available while the containerized message server is stopped or restarting. It
-accepts a centrally selected stable target version, pins that target to its
-resolved Docker digest, and owns durable job state plus the fixed
-host-operation boundary. It does not accept arbitrary shell, Compose, image,
-digest, URL, or service input from callers.
+accepts a centrally selected stable target version, derives the fixed
+`dirextalk/message-server:<version>` Docker tag, and owns durable job state
+plus the fixed host-operation boundary. It does not accept arbitrary shell,
+Compose, image, digest, URL, or service input from callers.
 
 Version 1 supports Ubuntu 22.04 and 24.04 on `linux/amd64`. The daemon listens on a
 Unix socket; it does not expose a TCP port. The message server may call the
@@ -65,8 +65,9 @@ configuration, never a control-API input.
 
 The v1 Unix API prefix is `/_dirextalk/updater/v1/`. The root-owned control
 token is required for all control routes. `POST control/status` accepts only
-`{}` and reads the current server version from the host's pinned image. It
-returns `current_version`, `updater_ready`, desired state, any active job, and
+`{}` and reads the current server version from the host's configured canonical
+tag or a legacy digest-pinned image. It returns `current_version`,
+`updater_ready`, desired state, any active job, and
 watchdog state. `direct_contract_version` is `2` only for the safe direct-job
 and replay contract described below.
 
@@ -76,36 +77,24 @@ and replay contract described below.
 {
   "target_version": "v1.0.3",
   "idempotency_key": "lowercase UUID",
-  "client_version": "v1.0.0",
   "confirm": "apply_release_change"
 }
 ```
 
 The target must be canonical `vX.Y.Z` and greater than the host's current
-version. For every new key, the updater fetches the latest published stable
-message-server Release from its fixed GitHub repository, enforces bounded and
-allowlisted HTTPS asset redirects, verifies `release-index.json.sha256`, and
-strictly validates the canonical index and embedded manifest digests. It then
-requires one explicit source-version/digest to target-version edge, proves the
-host's pinned source digest and schema health, and checks the supplied client
-version against the target manifest. A mutable image tag is never an upgrade
-authority.
+version. The authenticated message server is responsible for selecting a
+centrally authorized version before it calls the updater. The updater does not
+contact GitHub or another release source, fetch a release index or manifest,
+require an `upgrade_from`/predecessor edge, or accept/verify a target digest.
+It derives only `dirextalk/message-server:<target_version>` and atomically
+persists that version with the job. The optional legacy `client_version` field
+is accepted for caller compatibility but is not an upgrade gate.
 
-The release workflow emits the canonical index only after exact retained-data
-attestations and their checksums have passed for every configured source
-digest. The published checksum-bound index is therefore the runtime,
-attestation-derived edge authority; the updater independently verifies that
-index, the selected manifest, and the observed source digest before accepting
-the edge. It atomically persists their digests and compatibility facts in a
-single-hop contract-v2 Plan before the server is stopped. Indirect paths are
-not silently converted into direct upgrades.
-Existing persisted legacy jobs retain their plans only so automatic recovery
-can finish after an updater replacement; no new legacy GitHub-discovered plan
-can be created. Contract v2 creates its internal Plan only inside authenticated
-job creation; no discovery or plan-token API is exposed. The supported adopted
-`v0.15.2` source may enter the direct path only at its code-approved image
-digest; its explicit legacy health and recovery assumption is persisted in the
-backup metadata.
+Existing persisted legacy jobs retain their release-index plans and digest
+facts only so an interrupted execution or automatic recovery can finish after
+an updater replacement. New contract-v2 jobs never create a Plan or perform
+release discovery. The supported adopted `v0.15.2` source retains its explicit
+legacy health/recovery assumption in backup metadata.
 The `upgrading` desired state is internal to the job transaction, and external
 desired-state changes are rejected while a job is active.
 
@@ -123,9 +112,12 @@ source build/image/schema metadata are validated before the staging directory
 atomically replaces `backup/current`; only that one committed recovery point
 is retained. A corrupt staging backup never replaces it.
 
-The target is pulled and recreated only as `vX.Y.Z@sha256:...`. Success needs
-consecutive agreement between the running container image, PostgreSQL,
-internal health, and the same-domain Caddy health endpoint. Failure starts
+The target is pulled and recreated as
+`dirextalk/message-server:vX.Y.Z`. Success needs consecutive agreement between
+the configured/running canonical tag, the reported server version, PostgreSQL,
+internal health, and the same-domain Caddy health endpoint. The source image
+digest may be captured locally only to preserve an exact rollback point; it is
+not target authorization. Failure starts
 automatic recovery, and every restore checkpoint survives an updater restart.
 After three recovery failures the job enters maintenance and may expose only
 `restart` through `POST /_dirextalk/updater/v1/jobs/{job_id}/restart` with the
@@ -138,8 +130,8 @@ while the persisted desired state is `running`, requires three failed
 observations, uses at most three repair attempts in ten minutes, and enters a
 15-minute degraded cooldown when that budget is exhausted. Repair starts only
 Docker, PostgreSQL, message-server, and Caddy in that order using the already
-configured local tag-and-digest image. It never resolves a Release, pulls
-`latest`, rotates a backup, or runs a migration.
+configured local canonical tag or legacy digest pin. It never resolves a
+Release, pulls `latest`, rotates a backup, or runs a migration.
 In `systemd` mode the PostgreSQL and message-server steps remain in the fixed
 Compose project while Caddy observation and repair use only `caddy.service`.
 

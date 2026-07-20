@@ -1,6 +1,6 @@
 # Dirextalk Updater
 
-`dirextalk-updater` is the root host recovery boundary for a containerized message server. Keep it independent so discovery, upgrade progress, restart, rollback, desired state, and watchdog recovery remain available while the app is down.
+`dirextalk-updater` is the root host recovery boundary for a containerized message server. Keep it independent so version status, upgrade progress, restart, rollback, desired state, and watchdog recovery remain available while the app is down.
 
 ## Supported Contract
 
@@ -14,9 +14,9 @@
 - Require root and root-owned regular non-symlink config/token files with exact `0600` permissions.
 - Treat control and per-job bearers as secrets. Persist hashes/references only; keep tokens out of logs, errors, argv, fixtures, and reports.
 - Persist state atomically and durably. Create a job and enter `upgrading` transactionally; allow one active job and reject external desired-state changes while it runs.
-- Same-key idempotent replay recovers the committed job. A new key cannot reuse an expired plan.
-- Release discovery, compatibility, exact image identities, retained-data evidence, backup/restore, and recovery fail closed. Legacy bootstrap behavior is limited to its explicit tested migration path.
-- The watchdog operates only fixed code-owned services and already configured immutable images. It does not discover releases, pull `latest`, migrate, or expand its repair scope.
+- Same-key idempotent replay recovers the committed job and remains bound to its target version.
+- The authenticated upstream server owns central target-version authorization. The updater enforces canonical newer versions, fixed repository/tag derivation, host readiness, backup/restore, and recovery without rediscovering release metadata or requiring predecessor edges or target digests. Legacy bootstrap behavior is limited to its explicit tested migration path.
+- The watchdog operates only fixed code-owned services and already configured canonical tags or legacy immutable pins. It does not discover releases, pull `latest`, migrate, or expand its repair scope.
 
 ## Change And Verification
 

@@ -34,7 +34,6 @@ func TestControlJobRequiresAuthAndStrictDirectFields(t *testing.T) {
 		`{"target_version":"1.0.3","idempotency_key":"2d4d8444-2b3d-4f8f-8503-910f58b5b1df","confirm":"apply_release_change"}`,
 		`{"target_version":"v1.0.3","idempotency_key":"request-1","confirm":"apply_release_change"}`,
 		`{"target_version":"v1.0.3","idempotency_key":"2d4d8444-2b3d-4f8f-8503-910f58b5b1df","confirm":"wrong"}`,
-		`{"target_version":"v1.0.3","idempotency_key":"2d4d8444-2b3d-4f8f-8503-910f58b5b1df","client_version":"","confirm":"apply_release_change"}`,
 	} {
 		response := postJSON(t, service.Handler(), controlJobsPath, body, testControlToken, "")
 		if response.Code != http.StatusBadRequest {
@@ -71,7 +70,7 @@ func TestDirectJobBearerIsHashedAndAuthorizesPublicStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := state.Jobs[ticket.JobID]
-	if job.DirectRelease != nil || job.PlanTokenHash == "" || state.Plans[job.PlanTokenHash].Manifest.Version != "v1.0.3" || job.TotalHops != 1 || job.TotalSteps != executionTotalSteps {
+	if job.DirectRelease == nil || job.DirectRelease.Version != "v1.0.3" || job.DirectRelease.ImageDigest != "" || job.PlanTokenHash != "" || len(state.Plans) != 0 || job.TotalHops != 1 || job.TotalSteps != executionTotalSteps {
 		t.Fatalf("direct job did not preserve the immutable target: %#v", job)
 	}
 
@@ -111,8 +110,7 @@ func TestDirectJobIdempotencyBindsTargetVersion(t *testing.T) {
 func TestReplayOnlyUnknownKeyNeverCreatesJob(t *testing.T) {
 	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
 	runtime := newTestDirectRuntime()
-	releaseSource := &staticDirectReleaseSource{data: []byte(directTestReleaseIndexJSON(t))}
-	service, err := NewService(store, testControlToken, WithDirectJobRuntime(runtime), WithReleaseSource(releaseSource))
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(runtime))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +119,8 @@ func TestReplayOnlyUnknownKeyNeverCreatesJob(t *testing.T) {
 		t.Fatalf("unknown replay key was not rejected precisely: %d %s", response.Code, response.Body.String())
 	}
 	state, loadErr := store.Load(context.Background())
-	if loadErr != nil || len(state.Jobs) != 0 || len(state.Plans) != 0 || runtime.inspectCalls != 0 || releaseSource.calls != 0 {
-		t.Fatalf("replay miss performed create gates or changed state: state=%#v runtime_calls=%d release_calls=%d err=%v", state, runtime.inspectCalls, releaseSource.calls, loadErr)
+	if loadErr != nil || len(state.Jobs) != 0 || len(state.Plans) != 0 || runtime.currentCalls != 0 {
+		t.Fatalf("replay miss performed create gates or changed state: state=%#v runtime_calls=%d err=%v", state, runtime.currentCalls, loadErr)
 	}
 }
 
@@ -211,13 +209,8 @@ func TestReplayOnlySerializesActiveToRolledBackRace(t *testing.T) {
 
 func TestDirectJobRejectsDowngradeOrNoop(t *testing.T) {
 	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
-	runtime := &directControlRuntime{
-		currentVersion: "v1.0.3",
-		source: DirectSource{
-			Version: "v1.0.3", ImageDigest: "sha256:" + strings.Repeat("a", 64), SchemaVersion: 2, SchemaCompatVersion: 1,
-		},
-	}
-	service, err := NewService(store, testControlToken, WithDirectJobRuntime(runtime), WithReleaseSource(&staticDirectReleaseSource{data: []byte(directTestReleaseIndexJSON(t))}))
+	runtime := &directControlRuntime{currentVersion: "v1.0.3"}
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(runtime))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +264,7 @@ func newTestService(t *testing.T) (*Service, *StateStore) {
 	t.Helper()
 	store := NewStateStore(filepath.Join(t.TempDir(), "state.json"))
 	runtime := newTestDirectRuntime()
-	service, err := NewService(store, testControlToken, WithDirectJobRuntime(runtime), WithReleaseSource(&staticDirectReleaseSource{data: []byte(directTestReleaseIndexJSON(t))}))
+	service, err := NewService(store, testControlToken, WithDirectJobRuntime(runtime))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
@@ -279,12 +272,7 @@ func newTestService(t *testing.T) (*Service, *StateStore) {
 }
 
 func newTestDirectRuntime() *directControlRuntime {
-	return &directControlRuntime{
-		currentVersion: "v1.0.0",
-		source: DirectSource{
-			Version: "v1.0.0", ImageDigest: "sha256:" + strings.Repeat("0", 64), SchemaVersion: 1, SchemaCompatVersion: 1,
-		},
-	}
+	return &directControlRuntime{currentVersion: "v1.0.0"}
 }
 
 func directJobRequest(target, idempotencyKey string) string {

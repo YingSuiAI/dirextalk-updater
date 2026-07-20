@@ -1,21 +1,13 @@
 package updater
 
 import (
-	"context"
 	"fmt"
-	"strings"
 )
 
 const DirectContractVersion = 2
 
-// ReleaseSource returns the checksum-verified canonical index from the latest
-// published stable message-server release.
-type ReleaseSource interface {
-	Latest(context.Context) ([]byte, error)
-}
-
-// DirectSource contains only host-observed facts. It is compared with the
-// trusted release edge before a job and its bound plan are committed.
+// DirectSource is retained for validation and recovery of persisted legacy
+// release-index plans. New direct jobs do not create or consume it.
 type DirectSource struct {
 	Version             string
 	ImageDigest         string
@@ -34,20 +26,6 @@ func (source DirectSource) Validate() error {
 		return fmt.Errorf("current schema versions are invalid")
 	}
 	return nil
-}
-
-func normalizeRequiredClientVersion(value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", fmt.Errorf("client_version is required")
-	}
-	if !strings.HasPrefix(value, "v") {
-		value = "v" + value
-	}
-	if _, err := parseCanonicalVersion("client_version", value); err != nil {
-		return "", err
-	}
-	return value, nil
 }
 
 func validateClientCompatibility(clientVersion string, manifest Manifest) error {

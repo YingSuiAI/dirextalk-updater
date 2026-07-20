@@ -196,20 +196,51 @@ func TestDirectRepositoryDigestRejectsAmbiguousOrForeignResults(t *testing.T) {
 func TestComposeRuntimePreparesDirectBackupWithoutReleaseIndex(t *testing.T) {
 	t.Parallel()
 	paths := testHostPaths(t, t.TempDir())
-	runner := &fakeHostCommandRunner{}
+	if err := os.WriteFile(paths.envFile, []byte("DOMAIN=d1.example.test\nMESSAGE_SERVER_IMAGE="+taggedImageRef("v1.0.0")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeHostCommandRunner{imageRef: taggedImageRef("v1.0.0")}
 	runtime := newTestComposeRuntime(paths, runner)
-	target := DirectRelease{Version: "v1.0.3", ImageDigest: "sha256:" + strings.Repeat("a", 64)}
+	target := DirectRelease{Version: "v1.0.3"}
 	metadata, err := runtime.PrepareDirectBackup(context.Background(), Job{ID: "job_direct_backup", CurrentVersion: "v1.0.0", TargetVersion: target.Version}, target, ignoreProgress)
 	if err != nil {
 		t.Fatalf("prepare direct backup: %v", err)
 	}
-	if metadata.Version != "v1.0.0" || metadata.ImageDigest != "sha256:"+strings.Repeat("1", 64) || metadata.LegacyBootstrapAssumption {
+	if metadata.Version != "v1.0.0" || metadata.ImageDigest != "sha256:"+strings.Repeat("a", 64) || metadata.LegacyBootstrapAssumption {
 		t.Fatalf("unexpected direct recovery metadata: %#v", metadata)
 	}
 	for _, call := range runner.calls {
 		if strings.Contains(call, "github") || strings.Contains(call, "release-index") {
 			t.Fatalf("direct backup queried release discovery: %#v", runner.calls)
 		}
+	}
+}
+
+func TestComposeRuntimeActivatesAndChecksDirectTargetByCanonicalTag(t *testing.T) {
+	t.Parallel()
+	paths := testHostPaths(t, t.TempDir())
+	target := DirectRelease{Version: "v1.0.7"}
+	runner := &fakeHostCommandRunner{
+		imageRef:   taggedImageRef(target.Version),
+		healthJSON: `{"status":"ok","version":"v1.0.7","schema_version":2,"schema_compat_version":1}`,
+	}
+	runtime := newTestComposeRuntime(paths, runner)
+	if err := runtime.ActivateDirectTarget(context.Background(), target, ignoreProgress); err != nil {
+		t.Fatalf("activate tagged target: %v", err)
+	}
+	if err := runtime.CheckDirectTarget(context.Background(), target); err != nil {
+		t.Fatalf("check tagged target: %v", err)
+	}
+	data, err := os.ReadFile(paths.envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "MESSAGE_SERVER_IMAGE="+taggedImageRef(target.Version)+"\n") {
+		t.Fatalf("Compose target was not written as the canonical tag: %s", data)
+	}
+	joined := strings.Join(runner.calls, "\n")
+	if !strings.Contains(joined, "docker pull "+taggedImageRef(target.Version)) || strings.Contains(joined, taggedImageRef(target.Version)+"@sha256:") {
+		t.Fatalf("direct activation did not use only the canonical tag: %s", joined)
 	}
 }
 

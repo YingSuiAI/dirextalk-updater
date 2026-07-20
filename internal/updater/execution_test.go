@@ -693,7 +693,7 @@ func seedQueuedDirectExecutionJob(t *testing.T) (*StateStore, string) {
 	store := NewStateStore(t.TempDir() + "/runtime.json")
 	state := NewRuntimeState()
 	jobID := "job_direct_execution"
-	target := DirectRelease{Version: "v1.0.3", ImageDigest: "sha256:" + strings.Repeat("a", 64)}
+	target := DirectRelease{Version: "v1.0.3"}
 	state.Jobs[jobID] = Job{
 		ID:                jobID,
 		Status:            JobQueued,

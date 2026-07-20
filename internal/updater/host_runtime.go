@@ -161,8 +161,8 @@ func (runtime *ComposeRuntime) Recover(ctx context.Context) error {
 	return runtime.backups.Recover(ctx)
 }
 
-// CurrentVersion reads only the pinned local image reference. It never asks a
-// registry or GitHub for release metadata.
+// CurrentVersion reads only the configured canonical image reference. It never
+// asks a registry or release service for metadata.
 func (runtime *ComposeRuntime) CurrentVersion(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -171,7 +171,7 @@ func (runtime *ComposeRuntime) CurrentVersion(ctx context.Context) (string, erro
 	if err != nil {
 		return "", err
 	}
-	version, _, err := parsePinnedImageRef(imageRef)
+	version, _, err := parseAllowedImageRef(imageRef)
 	if err != nil {
 		return "", err
 	}
@@ -179,16 +179,16 @@ func (runtime *ComposeRuntime) CurrentVersion(ctx context.Context) (string, erro
 }
 
 // PinInitialLatest converts the deployer's one-time latest bootstrap image into
-// the immutable version+digest form required by all subsequent upgrade jobs.
-// It accepts no caller-selected repository, version, or digest.
+// an immutable initial recovery identity. Already configured canonical version
+// tags and legacy digest pins are reconciled without release discovery.
 func (runtime *ComposeRuntime) PinInitialLatest(ctx context.Context) error {
 	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
 	if err != nil {
 		return err
 	}
-	if _, _, err := parsePinnedImageRef(imageRef); err == nil {
+	if _, _, err := parseAllowedImageRef(imageRef); err == nil {
 		if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "message-server")...); err != nil {
-			return fmt.Errorf("reconcile initially pinned message-server: %w", err)
+			return fmt.Errorf("reconcile initially configured message-server: %w", err)
 		}
 		return nil
 	}
@@ -432,9 +432,8 @@ func (runtime *ComposeRuntime) PrepareBackup(ctx context.Context, job Job, plan 
 	return metadata, nil
 }
 
-// PrepareDirectBackup is retained only for recovery compatibility with
-// pre-contract-v2 development jobs. Contract-v2 jobs use a release-index-bound
-// Plan and PrepareBackup instead.
+// PrepareDirectBackup creates the recovery point for the centrally authorized
+// tag-based direct path. It also accepts digest-bound persisted legacy targets.
 func (runtime *ComposeRuntime) PrepareDirectBackup(ctx context.Context, job Job, target DirectRelease, progress func(JobStatus) error) (metadata BackupMetadata, returnErr error) {
 	ctx, cancel := context.WithTimeout(ctx, backupTimeout)
 	defer cancel()
@@ -585,13 +584,17 @@ func (runtime *ComposeRuntime) ActivateDirectTarget(ctx context.Context, target 
 		return hostMutationError{cause: err}
 	}
 	targetRef := target.ImageRef()
-	if err := runtime.pullVerifiedImage(ctx, targetRef, target.ImageDigest); err != nil {
+	if target.ImageDigest == "" {
+		if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", "pull", targetRef); err != nil {
+			return hostMutationError{cause: fmt.Errorf("pull message-server target tag: %w", err)}
+		}
+	} else if err := runtime.pullVerifiedImage(ctx, targetRef, target.ImageDigest); err != nil {
 		return hostMutationError{cause: err}
 	}
 	if err := progress(JobStopping); err != nil {
 		return hostMutationError{cause: err}
 	}
-	if err := writePinnedImage(runtime.paths.envFile, targetRef, os.Rename, syncDirectory); err != nil {
+	if err := writeAllowedImage(runtime.paths.envFile, targetRef, os.Rename, syncDirectory); err != nil {
 		return hostMutationError{cause: err, mutated: true}
 	}
 	if err := progress(JobMigrating); err != nil {
@@ -683,9 +686,9 @@ func (runtime *ComposeRuntime) RestartCurrent(ctx context.Context, job Job) erro
 	if err != nil {
 		return err
 	}
-	version, digest, err := parsePinnedImageRef(imageRef)
+	version, digest, err := parseAllowedImageRef(imageRef)
 	if err != nil || (version != job.CurrentVersion && version != job.TargetVersion) {
-		return fmt.Errorf("current pinned image does not belong to the job version edge")
+		return fmt.Errorf("current image does not belong to the job version edge")
 	}
 	consecutive := 0
 	var lastErr error
@@ -721,9 +724,9 @@ func (runtime *ComposeRuntime) ObserveWatchdog(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	version, digest, err := parsePinnedImageRef(imageRef)
+	version, digest, err := parseAllowedImageRef(imageRef)
 	if err != nil {
-		return fmt.Errorf("configured message-server image is not pinned")
+		return fmt.Errorf("configured message-server image is invalid")
 	}
 	if err := runtime.checkCurrentOnce(ctx, version, digest); err != nil {
 		return fmt.Errorf("configured message-server release is unhealthy")
@@ -731,7 +734,7 @@ func (runtime *ComposeRuntime) ObserveWatchdog(ctx context.Context) error {
 	return nil
 }
 
-// RepairWatchdog starts only the fixed, currently pinned host topology. It
+// RepairWatchdog starts only the fixed, currently configured host topology. It
 // never pulls an image, resolves a release, rotates backup state, or runs an
 // upgrade/migration command.
 func (runtime *ComposeRuntime) RepairWatchdog(ctx context.Context) error {
@@ -744,13 +747,13 @@ func (runtime *ComposeRuntime) RepairWatchdog(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	version, digest, err := parsePinnedImageRef(imageRef)
+	version, digest, err := parseAllowedImageRef(imageRef)
 	if err != nil {
-		return fmt.Errorf("configured message-server image is not pinned")
+		return fmt.Errorf("configured message-server image is invalid")
 	}
-	local, err := runtime.localPinnedImageAvailable(ctx, imageRef, digest)
+	local, err := runtime.localAllowedImageAvailable(ctx, imageRef, digest)
 	if err != nil || !local {
-		return fmt.Errorf("configured pinned message-server image is not available locally")
+		return fmt.Errorf("configured message-server image is not available locally")
 	}
 	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", runtime.composeArgs("up", "-d", "--no-deps", "--pull", "never", "postgres")...); err != nil {
 		return fmt.Errorf("start watchdog PostgreSQL: %w", err)
@@ -791,7 +794,7 @@ func (runtime *ComposeRuntime) RepairWatchdog(ctx context.Context) error {
 			}
 		}
 	}
-	return fmt.Errorf("watchdog repair did not restore the pinned release: %w", lastErr)
+	return fmt.Errorf("watchdog repair did not restore the configured release: %w", lastErr)
 }
 
 func (runtime *ComposeRuntime) waitWatchdogPostgres(ctx context.Context) error {
@@ -887,16 +890,17 @@ func (runtime *ComposeRuntime) ensureSourceReady(ctx context.Context, expectedVe
 	return "", "", runtimeHealth{}, serviceUnavailableError{cause: fmt.Errorf("source service did not recover: %w", lastErr)}
 }
 
-// ensureDirectSourceReady is the legacy pre-contract-v2 source verifier. New
-// jobs use ensureSourceReady with the trusted release-index step.
+// ensureDirectSourceReady verifies the currently configured source without a
+// release lookup. A tag-only source is resolved locally to an immutable digest
+// solely for the rollback recovery point.
 func (runtime *ComposeRuntime) ensureDirectSourceReady(ctx context.Context, expectedVersion string) (string, string, runtimeHealth, error) {
 	imageRef, err := readEnvironmentValue(runtime.paths.envFile, "MESSAGE_SERVER_IMAGE")
 	if err != nil {
 		return "", "", runtimeHealth{}, err
 	}
-	version, digest, err := parsePinnedImageRef(imageRef)
+	version, digest, err := parseAllowedImageRef(imageRef)
 	if err != nil || version != expectedVersion {
-		return "", "", runtimeHealth{}, fmt.Errorf("pinned source image does not match the direct job version")
+		return "", "", runtimeHealth{}, fmt.Errorf("configured source image does not match the direct job version")
 	}
 	mode := healthValidationStrict
 	if version == legacyInitialVersion {
@@ -916,6 +920,16 @@ func (runtime *ComposeRuntime) ensureDirectSourceReady(ctx context.Context, expe
 		if lastErr == nil {
 			consecutive++
 			if consecutive >= runtime.paths.healthConsecutive {
+				if digest == "" {
+					repoDigests, inspectErr := runtime.commandOutput(ctx, "docker", "image", "inspect", "--format", "{{join .RepoDigests \"\\n\"}}", imageRef)
+					if inspectErr != nil {
+						return "", "", runtimeHealth{}, fmt.Errorf("inspect source image for recovery: %w", inspectErr)
+					}
+					digest, inspectErr = directRepositoryDigest(repoDigests)
+					if inspectErr != nil {
+						return "", "", runtimeHealth{}, fmt.Errorf("resolve source image for recovery: %w", inspectErr)
+					}
+				}
 				return version, digest, health, nil
 			}
 		} else {
@@ -1104,7 +1118,7 @@ func (runtime *ComposeRuntime) checkCurrentHealthWithMode(ctx context.Context, v
 	if err != nil {
 		return runtimeHealth{}, err
 	}
-	actualVersion, actualDigest, err := parsePinnedImageRef(strings.TrimSpace(imageRef))
+	actualVersion, actualDigest, err := parseAllowedImageRef(strings.TrimSpace(imageRef))
 	if err != nil || actualVersion != version || actualDigest != digest {
 		return runtimeHealth{}, fmt.Errorf("running image does not match expected release")
 	}
@@ -1239,6 +1253,19 @@ func (runtime *ComposeRuntime) localPinnedImageAvailable(ctx context.Context, im
 	return linePresent(repoDigests, AllowedImageRepository+"@"+expectedDigest), nil
 }
 
+func (runtime *ComposeRuntime) localAllowedImageAvailable(ctx context.Context, imageRef, expectedDigest string) (bool, error) {
+	if expectedDigest != "" {
+		return runtime.localPinnedImageAvailable(ctx, imageRef, expectedDigest)
+	}
+	if _, _, err := parseAllowedImageRef(imageRef); err != nil {
+		return false, err
+	}
+	if err := runtime.runner.Run(ctx, nil, io.Discard, "docker", "image", "inspect", imageRef); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (runtime *ComposeRuntime) writeCommandFile(ctx context.Context, path string, stdin io.Reader, args ...string) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -1263,16 +1290,30 @@ func composeContainerName(project ComposeProject, service string) string {
 }
 
 func parsePinnedImageRef(value string) (string, string, error) {
+	version, digest, err := parseAllowedImageRef(value)
+	if err != nil {
+		return "", "", err
+	}
+	if digest == "" {
+		return "", "", fmt.Errorf("image reference must contain one digest")
+	}
+	return version, digest, nil
+}
+
+func parseAllowedImageRef(value string) (string, string, error) {
 	prefix := AllowedImageRepository + ":"
 	if !strings.HasPrefix(value, prefix) {
 		return "", "", fmt.Errorf("image repository is not allowed")
 	}
 	parts := strings.Split(strings.TrimPrefix(value, prefix), "@")
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("image reference must contain one digest")
+	if len(parts) < 1 || len(parts) > 2 {
+		return "", "", fmt.Errorf("image reference is invalid")
 	}
 	if _, err := parseCanonicalVersion("image version", parts[0]); err != nil {
 		return "", "", err
+	}
+	if len(parts) == 1 {
+		return parts[0], "", nil
 	}
 	if !digestPattern.MatchString(parts[1]) {
 		return "", "", fmt.Errorf("image digest is invalid")
@@ -1280,14 +1321,29 @@ func parsePinnedImageRef(value string) (string, string, error) {
 	return parts[0], parts[1], nil
 }
 
+func taggedImageRef(version string) string {
+	return AllowedImageRepository + ":" + version
+}
+
 func pinnedImageRef(version, digest string) string {
-	return AllowedImageRepository + ":" + version + "@" + digest
+	return taggedImageRef(version) + "@" + digest
 }
 
 func writePinnedImage(envPath, imageRef string, replace func(string, string) error, syncDir func(string) error) error {
 	if _, _, err := parsePinnedImageRef(imageRef); err != nil {
 		return err
 	}
+	return writeImageEnvironment(envPath, imageRef, replace, syncDir)
+}
+
+func writeAllowedImage(envPath, imageRef string, replace func(string, string) error, syncDir func(string) error) error {
+	if _, _, err := parseAllowedImageRef(imageRef); err != nil {
+		return err
+	}
+	return writeImageEnvironment(envPath, imageRef, replace, syncDir)
+}
+
+func writeImageEnvironment(envPath, imageRef string, replace func(string, string) error, syncDir func(string) error) error {
 	data, err := os.ReadFile(envPath)
 	if err != nil {
 		return fmt.Errorf("read Compose environment: %w", err)

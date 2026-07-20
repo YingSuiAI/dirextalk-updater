@@ -98,7 +98,6 @@ func runServer(configPath string) error {
 		store,
 		controlToken,
 		updater.WithDirectJobRuntime(runtime),
-		updater.WithReleaseSource(updater.NewGitHubReleaseSource(&http.Client{Timeout: 30 * time.Second})),
 		updater.WithJobEngine(engine),
 		updater.WithHostOperationGate(hostGate),
 	)
